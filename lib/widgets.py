@@ -115,10 +115,13 @@ class Historia(Gtk.DrawingArea):
         if self.aviso and self.datos[-1] >= self.aviso:
             r, g, b = 0.88, 0.27, 0.25
         tope = max(self.maximo * 0.25, max(self.datos) * 1.15)
-        paso = w / (HISTORIA - 1)
+        # Se reparten por TODO el ancho con los datos que haya.
+        # Antes el paso era fijo (ancho / HISTORIA) y la linea se pegaba a la
+        # derecha: recien abierta la ventana solo se veia un garabato en la
+        # esquina hasta que el historial se llenaba, un par de minutos despues.
+        n = len(self.datos)
+        paso = w / (n - 1)
         pts = [(i * paso, h - (v / tope) * h) for i, v in enumerate(self.datos)]
-        d = w - pts[-1][0]
-        pts = [(x + d, y) for x, y in pts]
 
         cr.move_to(pts[0][0], h)
         for x, y in pts:

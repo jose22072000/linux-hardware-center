@@ -238,14 +238,17 @@ class Ventana(Adw.ApplicationWindow):
         lado. Aqui los grupos van en un FlowBox, asi que al ensanchar se
         reparten en dos columnas solos y al estrechar vuelven a una.
         """
+        # homogeneous=False a proposito: en un FlowBox homogeneo TODOS los
+        # hijos toman el tamaño del mas grande, asi que un grupo corto (los
+        # medidores) se estiraba hasta la altura del mas largo y dejaba medio
+        # panel en blanco. Cada grupo debe medir lo que mide.
         fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
                          max_children_per_line=2, min_children_per_line=1,
-                         homogeneous=True, row_spacing=18, column_spacing=18,
+                         homogeneous=False, row_spacing=18, column_spacing=18,
                          valign=Gtk.Align.START)
         for g in grupos:
-            # Sin esto el grupo se estira hasta la altura del mas alto de su
-            # fila y quedan huecos dentro de la tarjeta.
             g.set_valign(Gtk.Align.START)
+            g.set_hexpand(True)
             fb.append(g)
         cl = Adw.Clamp(maximum_size=1280, tightening_threshold=640, child=fb)
         for m in ("top", "bottom", "start", "end"):
@@ -262,6 +265,8 @@ class Ventana(Adw.ApplicationWindow):
                            max_children_per_line=4, min_children_per_line=2,
                            homogeneous=True, row_spacing=6, column_spacing=6)
         caja.set_margin_top(6); caja.set_margin_bottom(6)
+        caja.set_valign(Gtk.Align.START)
+        caja.set_vexpand(False)
         def aguja(clave, titulo, unidad, maximo, aviso=None, critico=None):
             a = Aguja(titulo, unidad, maximo, aviso, critico)
             self.agujas[clave] = a
