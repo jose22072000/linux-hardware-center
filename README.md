@@ -63,6 +63,8 @@ Es **el mismo proyecto**, no dos: la ventana y el widget escriben la misma
 configuración y el demonio la aplica, así que cambies donde cambies, lo otro se
 entera.
 
+![Widget de barra](docs/img/barra.png)
+
 ## Cómo está hecho
 
 ```

@@ -142,7 +142,6 @@ Panel {
       ? "Lo mas caliente: " + root.tempMaxQue + " a " + root.tempMax + "°C"
       : ""
     slotSize: Style.bar.iconSlot * (root.showLabel && !vertical ? 2 : 1)
-    tooltipText: ""
     onPressed: function(b) {
       if (b === Qt.RightButton) root.bar.run("omarchy-launch-or-focus-tui btop")
       else root.toggle()
@@ -156,7 +155,10 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(400))
+    // 400 se quedaba corto: los botones de perfil no cabian en una fila y
+    // las cifras de la derecha se pegaban a las etiquetas. Con 520 entran los
+    // cuatro perfiles y las lineas respiran.
+    contentWidth: panel.fittedContentWidth(Style.space(520))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
