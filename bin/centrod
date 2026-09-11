@@ -22,7 +22,12 @@ decide el perfil.
 """
 import os, sys, time, glob, pwd, collections, subprocess
 sys.path.insert(0, "/usr/local/lib/centro")
-import hw
+import hw, seguro
+
+# Programas que lanza root. Por nombre suelto los buscaria el PATH heredado;
+# se resuelven una vez contra rutas del sistema. Ver `lib/seguro.py`.
+PGREP = seguro.programa("pgrep")
+PYTHON = seguro.programa("python3") or sys.executable
 
 ESTADO = "/run/centro-estado"
 RESPALDO = "/run/centro-respaldo"       # brillo/teclado antes de entrar en fresco
@@ -65,9 +70,8 @@ class Vigia:
     IN_MOVED_TO    = 0x00000080
     IN_CREATE      = 0x00000100
 
-    def __init__(self, ruta):
+    def __init__(self, carpeta):
         self.fd = None
-        self.nombre = os.path.basename(ruta)
         try:
             import ctypes
             self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -75,7 +79,7 @@ class Vigia:
             if fd < 0:
                 return
             wd = self.libc.inotify_add_watch(
-                fd, os.path.dirname(ruta).encode(),
+                fd, carpeta.encode(),
                 self.IN_CLOSE_WRITE | self.IN_MOVED_TO | self.IN_CREATE)
             if wd < 0:
                 os.close(fd)
@@ -100,28 +104,49 @@ class Vigia:
             time.sleep(0.05)
 
 
-def ruta_config():
+def abrir_config():
+    """La configuracion vive en el HOME del usuario con sesion, o sea en una
+    carpeta donde el usuario escribe. Se abre UNA vez, validando la ruta
+    componente a componente, y a partir de ahi se trabaja contra ese
+    descriptor: ni esta funcion ni nadie vuelve a abrir por nombre."""
     u = hw.usuario_grafico()
     if not u:
         return None
-    return os.path.join(hw.dir_config(u.pw_dir), "centro.conf")
+    try:
+        dfd = seguro.abrir_carpeta(hw.dir_config(u.pw_dir), u.pw_uid,
+                                   u.pw_gid, crear=True)
+    except (OSError, seguro.Inseguro) as e:
+        print(f"la carpeta de configuracion no es de fiar ({e});"
+              " no se toca nada", flush=True)
+        return None
+    return seguro.Fichero(dfd, "centro.conf", u.pw_uid, u.pw_gid)
 
 
-def leer_config(ruta):
+def _pares(texto):
     """Pares clave=valor. Nunca se hace `source`: el fichero es de un usuario
     y ejecutar lo que ponga seria darle root a quien lo edite."""
     cfg = {}
+    for l in texto.splitlines():
+        l = l.strip()
+        if not l or l.startswith("#") or "=" not in l:
+            continue
+        k, v = l.split("=", 1)
+        cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def leer_config(ruta):
+    """Para ficheros NUESTROS, los de /run, donde solo escribe root."""
     try:
         with open(ruta) as f:
-            for l in f:
-                l = l.strip()
-                if not l or l.startswith("#") or "=" not in l:
-                    continue
-                k, v = l.split("=", 1)
-                cfg[k.strip()] = v.strip()
+            return _pares(f.read())
     except OSError:
-        pass
-    return cfg
+        return {}
+
+
+def leer(cfgf):
+    """Para el fichero del usuario: pasa por `seguro`, sin seguir enlaces."""
+    return _pares(cfgf.leer_texto())
 
 
 # ── Escrituras en el hardware ───────────────────────────────────────────────
@@ -447,8 +472,10 @@ def bateria_set(limite):
 # ── Deteccion del perfil ────────────────────────────────────────────────────
 
 def corriendo(nombres):
+    if not PGREP:
+        return False
     for n in nombres.split():
-        if subprocess.run(["pgrep", "-x", n], capture_output=True).returncode == 0:
+        if subprocess.run([PGREP, "-x", n], capture_output=True).returncode == 0:
             return True
     return False
 
@@ -526,35 +553,31 @@ def aplicar(perfil, cfg, anterior):
         teclado_set(cfg.get("fresco_teclado"))
 
 
-def escribir_config(ruta, cambios):
+def escribir_config(cfgf, cambios):
     """Cambia claves del fichero conservando los comentarios, que explican el
-    porque de cada ajuste."""
+    porque de cada ajuste. La escritura en si la hace `seguro`: temporal
+    imprevisible, dueño puesto por descriptor y reemplazo atomico."""
     import re
-    try:
-        lineas = open(ruta).readlines()
-    except OSError:
+    texto = cfgf.leer_texto(defecto=None)
+    if texto is None:
         return
+    lineas = texto.splitlines(keepends=True)
     pend = dict(cambios)
     out = []
     for l in lineas:
         m = re.match(r"^\s*([a-z_]+)\s*=", l)
-        if m and m.group(1) in pend:
-            out.append(f"{m.group(1)}={pend.pop(m.group(1))}\n")
+        k = m.group(1) if m else None
+        if k is not None and k in cambios:
+            # La clave puede estar repetida. Al leer gana la ULTIMA, asi que
+            # tocar solo la primera dejaba el valor viejo mandando: una accion
+            # repetida se atendia en bucle sin fin. Se queda una sola linea,
+            # en el sitio de la primera.
+            if k in pend:
+                out.append(f"{k}={pend.pop(k)}\n")
         else:
             out.append(l)
     out += [f"{k}={v}\n" for k, v in pend.items()]
-    tmp = ruta + ".tmp"
-    with open(tmp, "w") as f:
-        f.writelines(out)
-    os.replace(tmp, ruta)
-    # El fichero es del usuario: si lo escribe root hay que devolverselo o la
-    # ventana ya no podria guardar.
-    u = hw.usuario_grafico()
-    if u:
-        try:
-            os.chown(ruta, u.pw_uid, u.pw_gid)
-        except OSError:
-            pass
+    cfgf.escribir_texto("".join(out))
 
 
 def aplicar_globales(cfg, prev):
@@ -587,7 +610,7 @@ def aplicar_globales(cfg, prev):
             if clave == "webcam":
                 ec_set("webcam_block", {"on": "off", "off": "on"}.get(deseado), None)
         elif deseado is not None and actual != deseado:
-            escribir_config(_RUTA[0], {clave: actual})
+            escribir_config(_CFG[0], {clave: actual})
             print(f"{time.strftime('%H:%M:%S')}  {clave}: lo cambiaste en el"
                   f" equipo -> {actual}", flush=True)
     if cfg.get("fn_key") != prev.get("fn_key"):
@@ -651,7 +674,7 @@ def accion_liberar_memoria():
     'usada' en su valor real, que es lo que la gente quiere ver."""
     antes = hw.memoria()
     try:
-        subprocess.run(["sync"], timeout=30)
+        os.sync()
         hw.escribir("/proc/sys/vm/drop_caches", "3")
     except Exception:
         _resultado("No se pudo liberar la cache.")
@@ -673,7 +696,10 @@ def accion_prueba_esfuerzo():
     """
     _resultado("Cargando el procesador…")
     hilos = os.cpu_count() or 4
-    procs = [subprocess.Popen(["sh", "-c", "while :; do :; done"])
+    procs = [subprocess.Popen([PYTHON, "-c", "while True: pass"],
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
              for _ in range(hilos)]
     tmax = fmax = 0
     freno_antes = _throttles()
@@ -733,7 +759,7 @@ ACCIONES = {
 }
 
 
-def atender_accion(cfg, ruta):
+def atender_accion(cfg, cfgf):
     nombre = cfg.get("accion", "")
     if not nombre:
         return
@@ -750,27 +776,23 @@ def atender_accion(cfg, ruta):
     else:
         _resultado("Accion desconocida.")
     # La clave se borra siempre, tambien si fallo: si no, se repetiria en bucle.
-    try:
-        txt = open(ruta).read()
-        open(ruta, "w").write(txt.replace(f"accion={nombre}", "accion="))
-    except OSError:
-        pass
+    escribir_config(cfgf, {"accion": ""})
 
 
-_RUTA = [None]
+_CFG = [None]
 
 
 def main():
-    ruta = ruta_config()
-    _RUTA[0] = ruta
-    if not ruta:
+    cfgf = abrir_config()
+    _CFG[0] = cfgf
+    if not cfgf:
         print("no encuentro un usuario con sesion; nada que hacer", flush=True)
         return 1
-    print(f"configuracion: {ruta}", flush=True)
+    print(f"configuracion: {cfgf.nombre} (carpeta validada)", flush=True)
     actual, prev_cfg, prev_cfg_perfil, cfg = None, {}, {}, {}
     refuerzo = Refuerzo()
     enfriado = Enfriado()
-    vigia = Vigia(ruta)
+    vigia = Vigia(cfgf.carpeta_vigilable)
     if vigia.fd is None:
         print("aviso: sin inotify, se vuelve a sondear cada tic", flush=True)
     proxima_revision = 0.0
@@ -781,8 +803,8 @@ def main():
         # --- releer y decidir perfil ---
         # Se relee tambien cuando nos despierta el vigia, aunque no toque por
         # tiempo: ese despertar ES el usuario pulsando algo.
-        if ahora >= proxima_revision or leer_config(ruta) != cfg:
-            cfg = leer_config(ruta)
+        if ahora >= proxima_revision or leer(cfgf) != cfg:
+            cfg = leer(cfgf)
             nuevo = decidir(cfg)
             if nuevo != actual:
                 aplicar(nuevo, cfg, actual)
@@ -802,8 +824,8 @@ def main():
         aplicar_globales(cfg, prev_cfg)
         prev_cfg = cfg
         if cfg.get("accion"):
-            atender_accion(cfg, ruta)
-            cfg = leer_config(ruta)
+            atender_accion(cfg, cfgf)
+            cfg = leer(cfgf)
             prev_cfg = cfg
         if actual:
             techo(cfg.get(f"{actual}_techo", 80))

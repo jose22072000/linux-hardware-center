@@ -9,5 +9,50 @@ ExecStart=/usr/local/bin/centrod
 Restart=on-failure
 RestartSec=10
 
+# ── Cerco del demonio ───────────────────────────────────────────────────────
+# Corre como root porque escribe en sysfs y en el EC, asi que se le quita
+# todo lo que no necesita para esa tarea. Lo que SI necesita, y por que:
+#
+#   /run     deja ahi el estado que lee la ventana
+#   /home    escribe la configuracion del usuario (por descriptor, ver seguro.py)
+#   /sys /proc  el hardware y drop_caches; ProtectSystem no los toca
+#
+# PATH fijo: sin esto se hereda, y un PATH heredado decide que binario se
+# ejecuta. Los programas se resuelven ademas por ruta absoluta en el codigo.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+UMask=0022
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run /home /root
+PrivateTmp=yes
+# No habla con la red por ningun sitio; que no pueda.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+SystemCallArchitectures=native
+
+# Capacidades: medidas en maquina, no elegidas a ojo. Cada una responde a una
+# cosa concreta que el demonio hace, y quitando cualquiera de las tres algo
+# deja de funcionar:
+#
+#   CAP_DAC_OVERRIDE  crear la configuracion dentro de la carpeta del usuario,
+#                     que es suya y root no tiene permiso de escritura ahi
+#   CAP_CHOWN         devolverle ese fichero al usuario; sin esto la ventana
+#                     ya no podria guardar
+#   CAP_SYS_PTRACE    leer /proc/<pid>/fd de procesos ajenos, que es como se
+#                     averigua quien esta usando la grafica para entrar en el
+#                     perfil de juego
+#
+# CAP_FOWNER no hace falta a proposito: `seguro.py` pone el modo ANTES que el
+# dueño. CAP_DAC_READ_SEARCH tampoco: comprobado, no aporta nada aqui.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_SYS_PTRACE
+
 [Install]
 WantedBy=multi-user.target

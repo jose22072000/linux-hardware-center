@@ -49,7 +49,7 @@ instalar() {
 
   info "librerias -> /usr/local/lib/centro"
   install -d -m 755 /usr/local/lib/centro
-  install -m 644 "$AQUI/lib/hw.py" "$AQUI/lib/widgets.py" /usr/local/lib/centro/
+  install -m 644 "$AQUI/lib/hw.py" "$AQUI/lib/widgets.py" "$AQUI/lib/seguro.py" /usr/local/lib/centro/
   install -m 755 "$AQUI/lib/gpu-mode" /usr/local/lib/centro/
 
   info "demonio -> /usr/local/bin/centrod"
