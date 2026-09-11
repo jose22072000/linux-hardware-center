@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""Centro — panel de control del equipo.
+
+Lo que el fabricante hace en Windows, aqui y sin depender de que nos lo den:
+escenarios, ventiladores, bateria, privacidad y perfiles que cambian solos.
+
+Dos reglas de la interfaz:
+
+  1. **Nada se escribe a mano.** La curva del ventilador se arrastra, los
+     programas se eligen de una lista. Si el usuario tiene que teclear
+     "45 53 61 69 77 84" es que la interfaz no esta terminada.
+  2. **Si el equipo no lo tiene, no se enseña.** Sin bateria no hay pestaña de
+     bateria; sin controlador embebido no hay curva. Nunca un boton muerto.
+
+No pide contraseña: solo escribe un fichero de texto del usuario. Quien tiene
+permisos es el demonio `centrod`.
+"""
+import os, sys, subprocess, gi
+sys.path.insert(0, "/usr/local/lib/centro")
+import hw
+from widgets import Aguja, Historia, Curva
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio, Pango
+
+CONF = os.path.join(hw.dir_config(), "centro.conf")
+GPU_MODE = "/usr/local/lib/centro/gpu-mode"
+HYPRSUNSET = "/usr/bin/hyprsunset"
+RESULTADO = "/run/centro-resultado"
+ESTADO = "/run/centro-estado"
+PERFILES = ["auto", "juego", "trabajo", "estable", "reposo", "fresco"]
+EDITABLES = ["juego", "trabajo", "estable", "reposo", "fresco"]
+
+ETIQUETA = {"auto": "Automático", "juego": "Juego", "trabajo": "Trabajo",
+            "estable": "Estable", "reposo": "Reposo", "fresco": "Fresco"}
+ICONO = {"juego": "applications-games-symbolic", "trabajo": "text-editor-symbolic",
+         "estable": "view-continuous-symbolic",
+         "reposo": "weather-clear-night-symbolic", "fresco": "weather-windy-symbolic"}
+DESC = {
+    "juego": "Cuando hay un juego abierto o algo usando la gráfica dedicada.",
+    "trabajo": "Cuando tienes un editor o un entorno de desarrollo abierto.",
+    "estable": "Sin bandazos: ni el equipo pega tirones ni el ruido cambia. El "
+               "ventilador arranca ya soplando y sube muy despacio, así que se "
+               "queda casi siempre igual. Se pone a mano.",
+    "reposo": "Ni juego ni trabajo. Aquí es donde se ahorra de verdad.",
+    "fresco": "Para cuando hace calor. El único que baja la pantalla y apaga "
+              "el teclado; al salir los deja como estaban.",
+}
+
+
+def leer_conf():
+    cfg = {}
+    try:
+        for l in open(CONF):
+            l = l.strip()
+            if l and not l.startswith("#") and "=" in l:
+                k, v = l.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+def escribir_conf(cambios):
+    """Reescribe solo lo tocado: los comentarios del fichero explican cada
+    ajuste y perderlos seria perder la documentacion."""
+    import re
+    try:
+        lineas = open(CONF).readlines()
+    except OSError:
+        return
+    pend = dict(cambios)
+    out = []
+    for l in lineas:
+        m = re.match(r"^\s*([a-z_]+)\s*=", l)
+        if m and m.group(1) in pend:
+            out.append(f"{m.group(1)}={pend.pop(m.group(1))}\n")
+        else:
+            out.append(l)
+    out += [f"{k}={v}\n" for k, v in pend.items()]
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(out)
+    os.replace(tmp, CONF)
+
+
+def procesos_vivos():
+    """Programas abiertos ahora, para elegirlos de una lista en vez de
+    teclear su nombre. Se filtran los del sistema: nadie quiere ver
+    `kworker` en un selector de juegos."""
+    try:
+        out = subprocess.run(["ps", "-eo", "comm="], capture_output=True,
+                             text=True, timeout=4).stdout
+    except Exception:
+        return []
+    fuera = ("kworker", "ksoftirqd", "migration", "rcu_", "irq/", "systemd",
+             "dbus", "gvfs", "at-spi", "pipewire", "wireplumber", "xdg-")
+    vistos = {l.strip() for l in out.split("\n") if l.strip()}
+    return sorted(p for p in vistos
+                  if not p.startswith(fuera) and not p.startswith("[") and len(p) > 2)
+
+
+class Etiquetas(Gtk.Box):
+    """Lista de programas como etiquetas quitables, con un boton para añadir
+    desde los que esten abiertos. Sustituye a una caja de texto."""
+
+    def __init__(self, valores, al_cambiar):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.valores = list(valores)
+        self.al_cambiar = al_cambiar
+        self.set_margin_start(12); self.set_margin_end(12)
+        self.set_margin_top(4); self.set_margin_bottom(12)
+        self.caja = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                max_children_per_line=30, row_spacing=6,
+                                column_spacing=6, homogeneous=False)
+        self.append(self.caja)
+        b = Gtk.Button(icon_name="list-add-symbolic", label="Añadir programa")
+        b.set_halign(Gtk.Align.START)
+        b.add_css_class("flat")
+        b.connect("clicked", self._añadir)
+        self.append(b)
+        self._pintar()
+
+    def _pintar(self):
+        while (c := self.caja.get_first_child()):
+            self.caja.remove(c)
+        for v in self.valores:
+            caja = Gtk.Box(spacing=2)
+            caja.add_css_class("card")
+            et = Gtk.Label(label=v)
+            et.set_margin_start(10); et.set_margin_top(4); et.set_margin_bottom(4)
+            et.set_ellipsize(Pango.EllipsizeMode.END)
+            caja.append(et)
+            x = Gtk.Button(icon_name="window-close-symbolic")
+            x.add_css_class("flat"); x.add_css_class("circular")
+            x.connect("clicked", self._quitar, v)
+            caja.append(x)
+            self.caja.append(caja)
+
+    def _quitar(self, _b, v):
+        if v in self.valores:
+            self.valores.remove(v)
+            self._pintar()
+            self.al_cambiar(" ".join(self.valores))
+
+    def _añadir(self, _b):
+        d = Adw.Dialog(title="Añadir programa", content_width=420, content_height=520)
+        pag = Adw.PreferencesPage()
+        g = Adw.PreferencesGroup(
+            description="Programas abiertos ahora mismo. Ábrelo antes de "
+                        "buscarlo aquí y aparecerá en la lista.")
+        busca = Gtk.SearchEntry(placeholder_text="Buscar…")
+        g.add(busca)
+        lista = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        lista.add_css_class("boxed-list")
+        filas = []
+        for p in procesos_vivos():
+            if p in self.valores:
+                continue
+            r = Adw.ActionRow(title=p, activatable=True)
+            r.add_suffix(Gtk.Image.new_from_icon_name("list-add-symbolic"))
+            r.connect("activated", self._elegido, p, d)
+            lista.append(r)
+            filas.append((p, r))
+        busca.connect("search-changed",
+                      lambda e: [r.set_visible(e.get_text().lower() in p.lower())
+                                 for p, r in filas])
+        g.add(lista)
+        pag.add(g)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        tv.set_content(Gtk.ScrolledWindow(child=pag, vexpand=True))
+        d.set_child(tv)
+        d.present(self.get_root())
+
+    def _elegido(self, _r, p, dlg):
+        if p not in self.valores:
+            self.valores.append(p)
+            self._pintar()
+            self.al_cambiar(" ".join(self.valores))
+        dlg.close()
+
+
+class Ventana(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Centro",
+                         default_width=680, default_height=800)
+        self.agujas, self.historias, self.curvas = {}, {}, {}
+        self.cargando = True
+        self.hay_ec = hw.ec_disponible()
+        self.bat = hw.bateria()
+
+        stack = Adw.ViewStack()
+        stack.add_titled_with_icon(self._panel(), "panel", "Panel",
+                                   "speedometer-symbolic")
+        stack.add_titled_with_icon(self._perfiles(), "perfiles", "Perfiles",
+                                   "preferences-system-symbolic")
+        stack.add_titled_with_icon(self._sensores(), "sensores", "Sensores",
+                                   "temperature-symbolic")
+        stack.add_titled_with_icon(self._equipo(), "equipo", "Equipo",
+                                   "computer-symbolic")
+        stack.add_titled_with_icon(self._herramientas(), "util", "Herramientas",
+                                   "applications-utilities-symbolic")
+        # Responsivo: con la ventana ancha las pestañas van arriba; al
+        # estrecharse (pantalla pequeña, media pantalla, un movil) se pasan a
+        # una barra abajo, que es donde llega el pulgar y donde caben.
+        # Sin esto, con cinco pestañas el conmutador de arriba se cortaba.
+        self.conmutador = Adw.ViewSwitcher(stack=stack,
+                                           policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.titulo = Adw.WindowTitle(title="Centro", subtitle="")
+        cab = Adw.HeaderBar()
+        cab.set_title_widget(self.conmutador)
+        self.barra_abajo = Adw.ViewSwitcherBar(stack=stack)
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(cab)
+        tv.set_content(stack)
+        tv.add_bottom_bar(self.barra_abajo)
+        self.set_content(tv)
+
+        self.set_size_request(340, 420)      # minimo razonable, no se rompe antes
+        bp = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("max-width: 680px"))
+        bp.add_setter(cab, "title-widget", self.titulo)
+        bp.add_setter(self.barra_abajo, "reveal", True)
+        self.add_breakpoint(bp)
+
+        self.cargando = False
+        self.refrescar()
+        GLib.timeout_add_seconds(2, self.refrescar)
+
+    # ─── Panel ───
+    def _pagina(self, grupos):
+        """Pagina que aprovecha el ancho en vez de dejarlo vacio.
+
+        `Adw.PreferencesPage` clava el contenido en una columna de ~600 px y
+        lo centra: en una ventana grande quedaban dos palmos de vacio a cada
+        lado. Aqui los grupos van en un FlowBox, asi que al ensanchar se
+        reparten en dos columnas solos y al estrechar vuelven a una.
+        """
+        fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                         max_children_per_line=2, min_children_per_line=1,
+                         homogeneous=True, row_spacing=18, column_spacing=18,
+                         valign=Gtk.Align.START)
+        for g in grupos:
+            # Sin esto el grupo se estira hasta la altura del mas alto de su
+            # fila y quedan huecos dentro de la tarjeta.
+            g.set_valign(Gtk.Align.START)
+            fb.append(g)
+        cl = Adw.Clamp(maximum_size=1280, tightening_threshold=640, child=fb)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(cl, f"set_margin_{m}")(18)
+        return Gtk.ScrolledWindow(child=cl, vexpand=True, hexpand=True)
+
+    def _panel(self):
+        grupos = []
+
+        g = Adw.PreferencesGroup()
+        # FlowBox y no Box: en una ventana estrecha los medidores bajan a la
+        # fila siguiente en vez de encogerse hasta no leerse.
+        caja = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                           max_children_per_line=4, min_children_per_line=2,
+                           homogeneous=True, row_spacing=6, column_spacing=6)
+        caja.set_margin_top(6); caja.set_margin_bottom(6)
+        def aguja(clave, titulo, unidad, maximo, aviso=None, critico=None):
+            a = Aguja(titulo, unidad, maximo, aviso, critico)
+            self.agujas[clave] = a
+            caja.append(a)
+        aguja("cpu_t", "Procesador", "°C", 100, 75, 88)
+        aguja("cpu_u", "Uso", "%", 100, 85, 96)
+        aguja("fan", "Ventilador", "rpm", 6000)
+        if hw.gpu_discreta():
+            aguja("gpu", "Gráfica", "°C", 100, 70, 85)
+        g.add(caja)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Últimos minutos")
+        for clave, t, maximo, aviso in (("cpu_t", "Temperatura", 100, 85),
+                                        ("cpu_u", "Uso del procesador", 100, None),
+                                        ("fan", "Ventilador", 6000, None)):
+            hist = Historia(maximo, aviso)
+            hist.set_margin_start(12); hist.set_margin_end(12)
+            hist.set_margin_top(2); hist.set_margin_bottom(8)
+            self.historias[clave] = hist
+            r = Adw.ActionRow(title=t)
+            g.add(r)
+            f = Adw.ActionRow(activatable=False)
+            f.set_child(hist)
+            g.add(f)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Estado")
+        self.f_perfil = Adw.ActionRow(title="Perfil activo", subtitle="—")
+        self.i_perfil = Gtk.Image.new_from_icon_name("emblem-system-symbolic")
+        self.f_perfil.add_prefix(self.i_perfil)
+        g.add(self.f_perfil)
+        self.f_refuerzo = Adw.ActionRow(title="Refuerzo del ventilador", subtitle="—")
+        self.f_refuerzo.add_prefix(Gtk.Image.new_from_icon_name("weather-windy-symbolic"))
+        g.add(self.f_refuerzo)
+        self.f_otros = Adw.ActionRow(title="Otros sensores", subtitle="—")
+        self.f_otros.add_prefix(Gtk.Image.new_from_icon_name("temperature-symbolic"))
+        g.add(self.f_otros)
+        grupos.append(g)
+        return self._pagina(grupos)
+    # ─── Perfiles ───
+    def _perfiles(self):
+        """Un perfil a la vez.
+
+        La primera version apilaba los cuatro en la misma pagina y habia que
+        hacer scroll sin fin para llegar al ultimo. Ahora se elige arriba y
+        solo se ve ese.
+        """
+        grupos = []
+        cfg = leer_conf()
+
+        g = Adw.PreferencesGroup(
+            title="Qué perfil usar ahora",
+            description="En automático cambia solo según lo que tengas abierto.")
+        self.combo = Adw.ComboRow(
+            title="Perfil activo",
+            model=Gtk.StringList.new([ETIQUETA[x] for x in PERFILES]))
+        act = cfg.get("modo", "auto")
+        self.combo.set_selected(PERFILES.index(act) if act in PERFILES else 0)
+        self.combo.connect("notify::selected", self._set_modo)
+        g.add(self.combo)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(
+            title="Ajustes de cada perfil",
+            description="Elige cuál quieres retocar.")
+        pila = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        for perf in EDITABLES:
+            pila.add_titled(self._un_perfil(perf, cfg), perf, ETIQUETA[perf])
+        sw = Gtk.StackSwitcher(stack=pila, hexpand=True)
+        sw.set_margin_bottom(10)
+        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        caja.append(sw)
+        caja.append(pila)
+        g.add(caja)
+        grupos.append(g)
+        return self._pagina(grupos)
+    def _un_perfil(self, perf, cfg):
+        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        et = Gtk.Label(label=DESC[perf], wrap=True, xalign=0)
+        et.add_css_class("dim-label")
+        et.set_margin_bottom(4)
+        caja.append(et)
+
+        lista = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        lista.add_css_class("boxed-list")
+
+        s = Adw.SpinRow.new_with_range(20, 100, 5)
+        s.set_title("Potencia máxima del procesador")
+        s.set_subtitle("menos potencia, menos calor y menos ruido")
+        s.add_prefix(Gtk.Image.new_from_icon_name(ICONO[perf]))
+        s.set_value(int(cfg.get(f"{perf}_techo", 80) or 80))
+        s.connect("notify::value", self._set_techo, perf)
+        lista.append(s)
+
+        shifts = hw.ec_opciones("shift_mode")
+        if shifts:
+            c = Adw.ComboRow(title="Escenario del equipo",
+                             model=Gtk.StringList.new([x.capitalize() for x in shifts]))
+            v = cfg.get(f"{perf}_shift")
+            if v in shifts:
+                c.set_selected(shifts.index(v))
+            c.connect("notify::selected", self._set_shift, perf, shifts)
+            lista.append(c)
+        caja.append(lista)
+
+        if self.hay_ec:
+            t = Gtk.Label(label="Curva del ventilador — arrastra los puntos",
+                          xalign=0)
+            t.add_css_class("heading")
+            t.set_margin_top(6)
+            caja.append(t)
+            cv = Curva()
+            cv.poner(cfg.get(f"{perf}_curva_t", ""), cfg.get(f"{perf}_curva_v", ""))
+            cv.connect("cambiada", self._curva_cambiada, perf)
+            self.curvas[perf] = cv
+            marco = Gtk.Frame()
+            marco.set_child(cv)
+            caja.append(marco)
+
+        if perf in ("juego", "trabajo"):
+            clave = f"{perf}_procesos"
+            t = Gtk.Label(label="Programas que activan este perfil", xalign=0)
+            t.add_css_class("heading")
+            t.set_margin_top(6)
+            caja.append(t)
+            caja.append(Etiquetas(cfg.get(clave, "").split(),
+                                  lambda v, k=clave: escribir_conf({k: v})))
+        return caja
+
+    # ─── Sensores ───
+    def _sensores(self):
+        """El detalle, separado del Panel a proposito: el Panel es para el
+        vistazo de un segundo y esto para cuando quieres mirar de verdad."""
+        grupos = []
+
+        g = Adw.PreferencesGroup(title="Núcleos",
+                                 description="Frecuencia y temperatura de cada hilo.")
+        self.caja_nucleos = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                        max_children_per_line=6, min_children_per_line=2,
+                                        row_spacing=6, column_spacing=6,
+                                        homogeneous=True)
+        self.caja_nucleos.set_margin_start(10); self.caja_nucleos.set_margin_end(10)
+        self.caja_nucleos.set_margin_top(4); self.caja_nucleos.set_margin_bottom(10)
+        self.barras_nucleo = []
+        g.add(self.caja_nucleos)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Almacenamiento")
+        self.grupo_discos = g
+        self.filas_disco = {}
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Memoria y red")
+        self.f_mem = Adw.ActionRow(title="Memoria", subtitle="—")
+        self.f_mem.add_prefix(Gtk.Image.new_from_icon_name("drive-harddisk-solidstate-symbolic"))
+        g.add(self.f_mem)
+        self.f_red = Adw.ActionRow(title="Red", subtitle="—")
+        self.f_red.add_prefix(Gtk.Image.new_from_icon_name("network-wired-symbolic"))
+        g.add(self.f_red)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(
+            title="Quién consume más",
+            description="Lo que está calentando el equipo ahora mismo.")
+        self.filas_top = []
+        for _ in range(5):
+            r = Adw.ActionRow(title="—", subtitle="")
+            self.filas_top.append(r)
+            g.add(r)
+        grupos.append(g)
+        return self._pagina(grupos)
+    # ─── Herramientas ───
+    def _herramientas(self):
+        grupos = []
+
+        if os.path.exists(HYPRSUNSET):
+            g = Adw.PreferencesGroup(
+                title="Pantalla",
+                description="Quitar el azul de la pantalla por la noche cansa "
+                            "menos la vista. No afecta al calor.")
+            self.sw_noche = Adw.SwitchRow(title="Luz nocturna",
+                                          subtitle="tonos cálidos")
+            self.sw_noche.connect("notify::active", self._set_noche)
+            g.add(self.sw_noche)
+            grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Comprobaciones")
+
+        r = Adw.ActionRow(
+            title="Probar los ventiladores",
+            subtitle="los sube a tope unos segundos y dice hasta dónde llega cada uno")
+        b = Gtk.Button(label="Probar")
+        b.add_css_class("suggested-action")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._accion, "probar_ventiladores")
+        r.add_suffix(b)
+        g.add(r)
+
+        r = Adw.ActionRow(
+            title="Prueba de esfuerzo",
+            subtitle="carga el procesador un minuto y dice hasta dónde llega y si "
+                     "tuvo que frenarse por calor")
+        b = Gtk.Button(label="Empezar")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._accion, "prueba_esfuerzo", 75)
+        r.add_suffix(b)
+        g.add(r)
+
+        r = Adw.ActionRow(
+            title="Liberar memoria cacheada",
+            subtitle="deja el contador en su valor real; el sistema ya usa la "
+                     "RAM libre como caché a propósito, así que no acelera nada")
+        b = Gtk.Button(label="Liberar")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._accion, "liberar_memoria")
+        r.add_suffix(b)
+        g.add(r)
+
+        r = Adw.ActionRow(
+            title="Volver a la curva de fábrica",
+            subtitle="por si algo se tuerce; elige un perfil después para recuperar la tuya")
+        b = Gtk.Button(label="Restablecer")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._accion, "curva_fabrica", 10)
+        r.add_suffix(b)
+        g.add(r)
+
+        self.f_resultado = Adw.ActionRow(title="Resultado", subtitle="—")
+        self.f_resultado.set_subtitle_selectable(True)
+        g.add(self.f_resultado)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(
+            title="Diagnóstico",
+            description="Para guardar o enviar a alguien cuando algo va mal.")
+        r = Adw.ActionRow(title="Copiar informe del equipo",
+                          subtitle="temperaturas, perfiles, discos y servicios")
+        b = Gtk.Button(label="Copiar")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._informe)
+        r.add_suffix(b)
+        g.add(r)
+        r = Adw.ActionRow(title="Ver el registro",
+                          subtitle="lo último que hizo el servicio")
+        b = Gtk.Button(label="Abrir")
+        b.set_valign(Gtk.Align.CENTER)
+        b.connect("clicked", self._registro)
+        r.add_suffix(b)
+        g.add(r)
+        grupos.append(g)
+
+        g = Adw.PreferencesGroup(title="Este equipo")
+        m = hw.memoria()
+        datos = [("Procesador", hw.cpu_modelo()),
+                 ("Memoria", f"{m['total_gb']:.0f} GB" if m else "—")]
+        if self.hay_ec:
+            datos.append(("Firmware", hw.ec_get("fw_version") or "—"))
+            datos.append(("Fecha del firmware", hw.ec_get("fw_release_date") or "—"))
+        if self.bat and self.bat["salud"]:
+            datos.append(("Salud de la batería",
+                          f"{self.bat['salud']} % de su capacidad original"))
+        if not self.hay_ec:
+            datos.append(("Control de ventiladores",
+                          "este equipo no expone un controlador compatible"))
+        for t, v in datos:
+            r = Adw.ActionRow(title=t, subtitle=v)
+            r.set_subtitle_selectable(True)
+            g.add(r)
+        grupos.append(g)
+        return self._pagina(grupos)
+    def _accion(self, boton, nombre, espera=20):
+        boton.set_sensitive(False)
+        self.f_resultado.set_subtitle("Trabajando…")
+        escribir_conf({"accion": nombre})
+        GLib.timeout_add_seconds(espera, lambda: boton.set_sensitive(True) or False)
+
+    def _texto_informe(self):
+        lin = ["=== Centro — informe del equipo ===",
+               f"Procesador: {hw.cpu_modelo()}"]
+        m = hw.memoria()
+        if m:
+            lin.append(f"Memoria: {m['usada_gb']:.1f} de {m['total_gb']:.0f} GB "
+                       f"({m['pct']} %)")
+        t = hw.temp_cpu()
+        lin.append(f"Temperatura del procesador: {t} °C" if t else "")
+        for etiqueta, rpm in hw.ventiladores():
+            if rpm:
+                lin.append(f"Ventilador {etiqueta}: {rpm} rpm")
+        e, gt, gw, cli = hw.gpu_estado()
+        if e:
+            lin.append(f"Gráfica dedicada: {e}"
+                       + (f", {gt} °C, {gw:.1f} W, {cli} programa(s)" if gt else ""))
+        for ruta, usado, total, pct, temp in hw.discos():
+            lin.append(f"Disco {ruta}: {usado:.0f}/{total:.0f} GB ({pct} %)"
+                       + (f", {temp} °C" if temp else ""))
+        b = hw.bateria()
+        if b:
+            lin.append(f"Batería: {b['capacidad']} %, {b['estado']}, "
+                       f"tope {b['limite']} %, salud {b['salud']} %")
+        if self.hay_ec:
+            for k in ("shift_mode", "fan_mode", "cooler_boost", "fw_version"):
+                lin.append(f"{k}: {hw.ec_get(k)}")
+        lin.append(f"Techo del turbo: {hw.techo_turbo()} %")
+        try:
+            lin.append("Estado: " + open(ESTADO).read().strip().replace("\n", ", "))
+        except OSError:
+            pass
+        return "\n".join(x for x in lin if x)
+
+    def _informe(self, _b):
+        self.get_clipboard().set(self._texto_informe())
+        self.f_resultado.set_subtitle("Informe copiado al portapapeles.")
+
+    def _registro(self, _b):
+        try:
+            txt = subprocess.run(["journalctl", "-u", "centrod", "-n", "60",
+                                  "--no-pager", "-o", "cat"],
+                                 capture_output=True, text=True, timeout=10).stdout
+        except Exception as e:
+            txt = str(e)
+        d = Adw.Dialog(title="Registro", content_width=620, content_height=520)
+        tv = Gtk.TextView(editable=False, monospace=True,
+                          wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        tv.get_buffer().set_text(txt or "sin registro")
+        tv.set_margin_start(12); tv.set_margin_end(12)
+        tv.set_margin_top(12); tv.set_margin_bottom(12)
+        sc = Gtk.ScrolledWindow(child=tv, vexpand=True)
+        barra = Adw.ToolbarView()
+        barra.add_top_bar(Adw.HeaderBar())
+        barra.set_content(sc)
+        d.set_child(barra)
+        d.present(self)
+
+    def _set_noche(self, sw, _):
+        if not self.cargando:
+            subprocess.run(["omarchy", "toggle", "nightlight",
+                            "on" if sw.get_active() else "off"],
+                           capture_output=True, timeout=10)
+
+    # ─── Equipo ───
+    def _equipo(self):
+        grupos = []
+        cfg = leer_conf()
+
+        if self.bat:
+            g = Adw.PreferencesGroup(
+                title="Batería",
+                description="Cargarla siempre al 100 % la desgasta antes. Si el "
+                            "equipo vive enchufado, 80 % alarga bastante su vida.")
+            self.f_bat = Adw.ActionRow(title="Estado", subtitle="—")
+            self.f_bat.add_prefix(Gtk.Image.new_from_icon_name("battery-symbolic"))
+            g.add(self.f_bat)
+            s = Adw.SpinRow.new_with_range(50, 100, 5)
+            s.set_title("Cargar como máximo hasta")
+            s.set_subtitle("100 % desactiva el límite")
+            s.set_value(int(cfg.get("bateria_limite", 100) or 100))
+            s.connect("notify::value", self._set_num, "bateria_limite")
+            g.add(s)
+            grupos.append(g)
+
+        if self.hay_ec:
+            g = Adw.PreferencesGroup(title="Equipo")
+            self.refuerzos = ["auto", "on", "off"]
+            c = Adw.ComboRow(
+                title="Refuerzo del ventilador",
+                subtitle="automático lo enciende al subir la temperatura media",
+                model=Gtk.StringList.new(["Automático", "Siempre encendido", "Apagado"]))
+            v = cfg.get("refuerzo", "auto")
+            c.set_selected(self.refuerzos.index(v) if v in self.refuerzos else 0)
+            c.connect("notify::selected", self._set_refuerzo)
+            g.add(c)
+
+            # Modo del ventilador: antes era una fila de texto que parecia
+            # pulsable y no hacia nada. Ahora se elige.
+            self.fanmodes = hw.ec_opciones("fan_mode") or ["advanced"]
+            nombres = {"advanced": "Por curva", "auto": "Automático del equipo",
+                       "silent": "Silencioso", "basic": "Básico"}
+            c = Adw.ComboRow(
+                title="Modo del ventilador",
+                subtitle="«por curva» usa la que dibujas en Perfiles",
+                model=Gtk.StringList.new([nombres.get(x, x.capitalize())
+                                          for x in self.fanmodes]))
+            v = cfg.get("fan_mode", "advanced")
+            if v in self.fanmodes:
+                c.set_selected(self.fanmodes.index(v))
+            c.connect("notify::selected", self._set_lista, "fan_mode", self.fanmodes)
+            g.add(c)
+
+            self.sw_super = Adw.SwitchRow(
+                title="Ahorro extremo",
+                subtitle="recorta todo lo que puede; el equipo va más lento")
+            self.sw_super.connect("notify::active", self._set_sw, "super_bateria")
+            g.add(self.sw_super)
+
+            self.sw_cam = Adw.SwitchRow(
+                title="Cámara",
+                subtitle="la desconecta de verdad y apaga el piloto de F6")
+            self.sw_cam.connect("notify::active", self._set_sw, "webcam")
+            g.add(self.sw_cam)
+
+            if hw.led_teclado():
+                mx = int(hw._leer(os.path.join(hw.led_teclado(), "max_brightness")) or 3)
+                sp = Adw.SpinRow.new_with_range(0, mx, 1)
+                sp.set_title("Luz del teclado")
+                sp.set_subtitle("son luces bajo las teclas: apagarlas quita calor "
+                                "justo donde apoyas los dedos")
+                sp.set_value(int(cfg.get("teclado", 0) or 0))
+                sp.connect("notify::value", self._set_num, "teclado")
+                g.add(sp)
+
+            if hw.ec_get("fn_key") is not None:
+                self.sw_fn = Adw.SwitchRow(
+                    title="Tecla Fn a la derecha",
+                    subtitle="apágalo para intercambiarla con la tecla de Windows")
+                self.sw_fn.connect("notify::active", self._set_fn)
+                g.add(self.sw_fn)
+
+            self.f_ec = Adw.ActionRow(title="Escenario activo", subtitle="—")
+            g.add(self.f_ec)
+            grupos.append(g)
+
+            g = Adw.PreferencesGroup(
+                title="Enfriado prolongado",
+                description="El ventilador sigue soplando después de que baje la "
+                            "temperatura. Sin esto para de golpe con el disipador "
+                            "aún caliente, y ese calor se queda dentro.")
+            cfg2 = leer_conf()
+            for clave, titulo, sub, lo, hi in (
+                ("refresco_desde", "Empieza a partir de", "grados", 50, 95),
+                ("refresco_hasta", "Puede aflojar bajando de", "grados", 35, 80),
+                ("refresco_minimo", "Aguanta al menos", "segundos", 0, 600)):
+                paso = 30 if clave == "refresco_minimo" else 5
+                sp = Adw.SpinRow.new_with_range(lo, hi, paso)
+                sp.set_title(titulo)
+                sp.set_subtitle(sub)
+                sp.set_value(int(cfg2.get(clave, 0) or 0))
+                sp.connect("notify::value", self._set_num, clave)
+                g.add(sp)
+            grupos.append(g)
+
+        # ── Gráfica dedicada: a dónde van las aplicaciones nuevas ──
+        if hw.gpu_discreta() and os.path.exists(GPU_MODE):
+            g = Adw.PreferencesGroup(
+                title="Gráfica",
+                description="Decide en qué tarjeta se dibujan los programas que "
+                            "abras a partir de ahora. Los ya abiertos no cambian.")
+            self.modos_gpu = ["intel", "auto", "nvidia"]
+            self.c_gpu = Adw.ComboRow(
+                title="Las aplicaciones nuevas usan",
+                model=Gtk.StringList.new([
+                    "La integrada — ahorro",
+                    "Automático — para jugar",
+                    "La dedicada — siempre"]))
+            self.c_gpu.connect("notify::selected", self._set_gpu)
+            g.add(self.c_gpu)
+            self.f_gpu = Adw.ActionRow(title="Estado de la gráfica", subtitle="—")
+            g.add(self.f_gpu)
+            grupos.append(g)
+
+        return self._pagina(grupos)
+    # ─── guardar ───
+    def _set_modo(self, c, _):
+        if not self.cargando:
+            escribir_conf({"modo": PERFILES[c.get_selected()]})
+
+    def _set_techo(self, s, _, perf):
+        if not self.cargando:
+            escribir_conf({f"{perf}_techo": str(int(s.get_value()))})
+
+    def _set_shift(self, c, _, perf, ops):
+        if not self.cargando:
+            escribir_conf({f"{perf}_shift": ops[c.get_selected()]})
+
+    def _curva_cambiada(self, cv, perf):
+        t, v = cv.como_texto()
+        escribir_conf({f"{perf}_curva_t": t, f"{perf}_curva_v": v})
+
+    def _set_num(self, s, _, clave):
+        if not self.cargando:
+            escribir_conf({clave: str(int(s.get_value()))})
+
+    def _set_sw(self, sw, _, clave):
+        if not self.cargando:
+            escribir_conf({clave: "on" if sw.get_active() else "off"})
+
+    def _set_lista(self, c, _, clave, opciones):
+        if not self.cargando:
+            escribir_conf({clave: opciones[c.get_selected()]})
+
+    def _set_fn(self, sw, _):
+        if not self.cargando:
+            escribir_conf({"fn_key": "right" if sw.get_active() else "left"})
+
+    def _set_gpu(self, c, _):
+        """Esto no pasa por el demonio: el modo de grafica es del entorno de la
+        sesion del usuario, no del sistema, asi que se aplica aqui mismo."""
+        if self.cargando:
+            return
+        subprocess.run([GPU_MODE, self.modos_gpu[c.get_selected()]],
+                       capture_output=True, timeout=10)
+
+    def _set_refuerzo(self, c, _):
+        if not self.cargando:
+            escribir_conf({"refuerzo": self.refuerzos[c.get_selected()]})
+
+    # ─── refresco ───
+    def refrescar(self):
+        est = {}
+        try:
+            for l in open(ESTADO):
+                if "=" in l:
+                    k, v = l.strip().split("=", 1); est[k] = v
+        except OSError:
+            pass
+        perfil = est.get("perfil", "?")
+        self.f_perfil.set_subtitle(
+            ETIQUETA.get(perfil, perfil) +
+            (" · cambia solo" if est.get("modo") == "auto" else " · fijado a mano"))
+        if perfil in ICONO:
+            self.i_perfil.set_from_icon_name(ICONO[perfil])
+        niveles = {"reposo": "en reposo", "medio": "activo", "alto": "a tope",
+                   "manual:on": "forzado a mano", "manual:off": "apagado a mano"}
+        self.f_refuerzo.set_subtitle(niveles.get(est.get("refuerzo", ""), "—"))
+
+        t = hw.temp_cpu()
+        self.agujas["cpu_t"].poner(t)
+        self.historias["cpu_t"].empujar(t)
+        u = hw.cpu_uso()
+        self.agujas["cpu_u"].poner(u)
+        self.historias["cpu_u"].empujar(u)
+        vs = [r for _, r in hw.ventiladores() if r]
+        rpm = max(vs) if vs else 0
+        self.agujas["fan"].poner(rpm, texto_alt=(str(rpm) if rpm else "parado"))
+        self.historias["fan"].empujar(rpm)
+        if "gpu" in self.agujas:
+            e, gt, gw, _ = hw.gpu_estado()
+            if e == "dormida":
+                self.agujas["gpu"].poner(0, texto_alt="zZ")
+            else:
+                self.agujas["gpu"].poner(gt, texto_alt=None if gt else "—")
+
+        otros = []
+        for nombre, pref in (("Wifi", "iwlwifi"), ("Disco", "nvme")):
+            v = hw.temp_por_nombre(pref)
+            if v:
+                otros.append(f"{nombre} {v} °C")
+        m = hw.memoria()
+        if m:
+            otros.append(f"Memoria {m['usada_gb']:.1f} de {m['total_gb']:.0f} GB")
+        self.f_otros.set_subtitle(" · ".join(otros) or "—")
+
+        b = hw.bateria()
+        if b and hasattr(self, "f_bat"):
+            lim = f" · tope {b['limite']} %" if b["limite"] and b["limite"] < 100 else ""
+            self.f_bat.set_subtitle(f"{b['capacidad']} % · {b['estado']}{lim}")
+        # Los interruptores se ponen con lo que dice el HARDWARE, no con lo
+        # que dice el fichero. Si los dos se separan —alguien toco el equipo
+        # por fuera, o una tecla del portatil— la ventana enseñaba un estado
+        # falso y el usuario no podia fiarse de lo que veia.
+        if self.hay_ec and hasattr(self, "f_ec"):
+            self.f_ec.set_subtitle(hw.ec_get("shift_mode") or "—")
+            self.cargando = True
+            self.sw_super.set_active(hw.ec_get("super_battery") == "on")
+            self.sw_cam.set_active(hw.ec_get("webcam") == "on")
+            if hasattr(self, "sw_fn"):
+                self.sw_fn.set_active(hw.ec_get("fn_key") == "right")
+            self.cargando = False
+
+        self._refrescar_sensores()
+        self._refrescar_util()
+
+        if hasattr(self, "c_gpu"):
+            try:
+                m = subprocess.run([GPU_MODE, "status"], capture_output=True,
+                                   text=True, timeout=4).stdout.strip().split()[0]
+            except Exception:
+                m = ""
+            if m in self.modos_gpu:
+                self.cargando = True
+                self.c_gpu.set_selected(self.modos_gpu.index(m))
+                self.cargando = False
+            e, gt, gw, cli = hw.gpu_estado()
+            if e == "dormida":
+                self.f_gpu.set_subtitle("dormida — ni gasta ni calienta")
+            elif cli == 0:
+                self.f_gpu.set_subtitle(
+                    f"despierta sin que nadie la use{' · ' + str(gt) + ' °C' if gt else ''}")
+            else:
+                self.f_gpu.set_subtitle(
+                    f"en uso por {cli} programa(s)"
+                    + (f" · {gt} °C · {gw:.1f} W" if gt and gw else ""))
+        return True
+
+
+    def _refrescar_sensores(self):
+        if not hasattr(self, "caja_nucleos"):
+            return
+        nuc = hw.nucleos()
+        # Los widgets se crean UNA vez y luego solo se actualizan: rehacerlos
+        # cada dos segundos parpadeaba y gastaba mas que todo lo que mide.
+        if not self.barras_nucleo:
+            for n, _f, _t in nuc:
+                c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                c.add_css_class("card")
+                c.set_margin_top(6); c.set_margin_bottom(6)
+                t = Gtk.Label(label=f"Hilo {n}")
+                t.add_css_class("dim-label")
+                t.add_css_class("caption")
+                v = Gtk.Label(label="—")
+                v.add_css_class("heading")
+                sub = Gtk.Label(label="")
+                sub.add_css_class("dim-label")
+                sub.add_css_class("caption")
+                for x in (t, v, sub):
+                    c.append(x)
+                self.caja_nucleos.append(c)
+                self.barras_nucleo.append((v, sub))
+        for (v, sub), (_n, mhz, temp) in zip(self.barras_nucleo, nuc):
+            v.set_label(f"{mhz} MHz" if mhz else "—")
+            sub.set_label(f"{temp} °C" if temp else "")
+
+        for ruta, usado, total, pct, temp in hw.discos():
+            if ruta not in self.filas_disco:
+                r = Adw.ActionRow(title=ruta)
+                r.add_prefix(Gtk.Image.new_from_icon_name("drive-harddisk-symbolic"))
+                b = Gtk.LevelBar()
+                b.set_size_request(120, -1)
+                b.set_valign(Gtk.Align.CENTER)
+                r.add_suffix(b)
+                self.grupo_discos.add(r)
+                self.filas_disco[ruta] = (r, b)
+            r, b = self.filas_disco[ruta]
+            r.set_subtitle(f"{usado:.0f} de {total:.0f} GB · {pct} % usado"
+                           + (f" · {temp} °C" if temp else ""))
+            b.set_value(pct / 100)
+
+        m = hw.memoria()
+        if m:
+            self.f_mem.set_subtitle(
+                f"{m['usada_gb']:.1f} de {m['total_gb']:.0f} GB · {m['pct']} % usada")
+        rx, tx = hw.red()
+        def fmt(k):
+            return f"{k/1024:.1f} MB/s" if k >= 1024 else f"{k:.0f} kB/s"
+        self.f_red.set_subtitle(f"bajada {fmt(rx)} · subida {fmt(tx)}")
+
+        for fila, dato in zip(self.filas_top, hw.top_procesos(5)):
+            nombre, cpu, mem = dato
+            fila.set_title(nombre)
+            fila.set_subtitle(f"{cpu:.0f} % de procesador · {mem:.1f} % de memoria")
+
+    def _refrescar_util(self):
+        if hasattr(self, "f_resultado"):
+            try:
+                txt = open(RESULTADO).read().strip()
+            except OSError:
+                txt = ""
+            self.f_resultado.set_subtitle(txt or "—")
+        if hasattr(self, "sw_noche"):
+            activo = bool(subprocess.run(["pgrep", "-x", "hyprsunset"],
+                                         capture_output=True).returncode == 0)
+            if activo != self.sw_noche.get_active():
+                self.cargando = True
+                self.sw_noche.set_active(activo)
+                self.cargando = False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="org.centro.Centro",
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        (self.props.active_window or Ventana(self)).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

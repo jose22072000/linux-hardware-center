@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""centrod — el demonio de Centro. Lo unico de este proyecto que corre como root.
+
+Diseño, en una frase: **toda la escritura privilegiada esta aqui y en ningun
+otro sitio**. La ventana y el widget de barra solo escriben un fichero de texto
+del usuario; este lo lee y aplica. Por eso nada de la interfaz pide contraseña.
+
+Elige perfil solo segun lo que haya abierto, o acata el que le fijen a mano.
+
+El 11/09/2026 absorbio a tres demonios que hacian una cosa cada uno:
+
+  cpu-freno          repone el tope del turbo, que power-profiles-daemon
+                     suelta al arrancar y al volver de suspension
+  thermal-guard      enciende el refuerzo del ventilador cuando la media de
+                     temperatura sube, con histeresis para que no parpadee
+  jarvis-ventilador  escribia la curva en el EC al arrancar
+
+Tenerlos separados obligaba a coordinarlos por ficheros y reinicios de
+servicio. Ahora es un solo bucle: tic rapido (5 s) para lo que hay que
+defender de otros programas, y cada pocos tics se relee la configuracion y se
+decide el perfil.
+"""
+import os, sys, time, glob, pwd, collections, subprocess
+sys.path.insert(0, "/usr/local/lib/centro")
+import hw
+
+ESTADO = "/run/centro-estado"
+RESPALDO = "/run/centro-respaldo"       # brillo/teclado antes de entrar en fresco
+PERFILES = ("juego", "trabajo", "estable", "reposo", "fresco")
+
+# Cada cuanto se comprueba lo que hay que defender y se atienden los cambios
+# del usuario. A 5 s un interruptor tardaba "un rato" en hacer efecto y
+# parecia roto; a 2 s se siente inmediato y el coste son unas pocas lecturas
+# de sysfs, que no se notan ni en la carga ni en la bateria.
+TIC = 2
+
+# Umbrales del refuerzo del ventilador, en grados. Suben y bajan por sitios
+# distintos a proposito (histeresis): si fueran el mismo, el refuerzo
+# parpadearia sin parar rondando el umbral.
+BOOST_SUBE_MEDIO, BOOST_BAJA_MEDIO = 76, 66
+BOOST_SUBE_ALTO,  BOOST_BAJA_ALTO  = 89, 83
+MUESTRAS = 15            # media movil; con una sola lectura "la media" es el pico
+
+# Registros de la curva en el EC de MSI. Seis puntos de temperatura y seis de
+# velocidad, para cada uno de los dos ventiladores.
+EC_IO = "/sys/kernel/debug/ec/ec0/io"
+REG = {"cpu_t": 0x6A, "cpu_v": 0x72, "gpu_t": 0x82, "gpu_v": 0x8A}
+
+
+def ruta_config():
+    u = hw.usuario_grafico()
+    if not u:
+        return None
+    return os.path.join(hw.dir_config(u.pw_dir), "centro.conf")
+
+
+def leer_config(ruta):
+    """Pares clave=valor. Nunca se hace `source`: el fichero es de un usuario
+    y ejecutar lo que ponga seria darle root a quien lo edite."""
+    cfg = {}
+    try:
+        with open(ruta) as f:
+            for l in f:
+                l = l.strip()
+                if not l or l.startswith("#") or "=" not in l:
+                    continue
+                k, v = l.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+# ── Escrituras en el hardware ───────────────────────────────────────────────
+
+def curva(temps, velocs):
+    """Escribe la curva en los DOS ventiladores. Valores fuera de rango se
+    ignoran enteros: media curva aplicada es peor que ninguna."""
+    if not os.path.exists(EC_IO):
+        return False
+    try:
+        t = [int(x) for x in temps.split()]
+        v = [int(x) for x in velocs.split()]
+    except ValueError:
+        return False
+    if len(t) != 6 or len(v) != 6:
+        return False
+    if not all(20 <= x <= 100 for x in t) or not all(0 <= x <= 100 for x in v):
+        return False
+    if t != sorted(t):
+        return False                       # el EC espera temperaturas crecientes
+    try:
+        with open(EC_IO, "r+b") as f:
+            for i in range(6):
+                for base, val in ((REG["cpu_t"], t[i]), (REG["cpu_v"], v[i]),
+                                  (REG["gpu_t"], t[i]), (REG["gpu_v"], v[i])):
+                    f.seek(base + i)
+                    f.write(bytes([val]))
+    except OSError:
+        return False
+    # Escribir la curva no basta: en modo "auto" el EC usa la suya de fabrica
+    # y ni mira estos registros.
+    if hw.ec_disponible() and hw.ec_get("fan_mode") != "advanced":
+        hw.escribir(os.path.join(hw.EC, "fan_mode"), "advanced")
+    return True
+
+
+def techo(pct):
+    """Repone el tope del turbo y la preferencia de energia.
+
+    Se REPONE en cada tic, no se pone una vez: power-profiles-daemon arranca el
+    mismo segundo que esto y aplica su perfil guardado, y lo vuelve a soltar al
+    despertar de suspension. Un disparo unico nunca sobrevivia a eso — el log
+    del arranque decia 80 % mientras la maquina estaba al 100 %.
+
+    `balance_performance` sube rapido cuando hace falta pero no se queda arriba
+    por costumbre, que es lo que hace `performance`.
+    """
+    try:
+        pct = str(int(pct))
+    except (TypeError, ValueError):
+        return
+    if not 20 <= int(pct) <= 100:
+        return
+    f = os.path.join(hw.PSTATE, "max_perf_pct")
+    if hw._leer(f) != pct:
+        hw.escribir(f, pct)
+    for epp in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"):
+        if hw._leer(epp) != "balance_performance":
+            hw.escribir(epp, "balance_performance")
+
+
+class Enfriado:
+    """Mantiene el ventilador soplando DESPUES de que baje la temperatura.
+
+    El problema que resuelve: la curva la aplica el propio controlador en
+    hardware y reacciona al instante. Cuando el procesador cae de 85 a 55 el
+    ventilador pasa de 88 % a 33 % en un segundo — pero el disipador sigue
+    caliente y ese calor se queda dentro en vez de salir.
+
+    Funciona con un rango, no con un punto:
+      - por encima de `desde` se entra en enfriado
+      - no se sale hasta bajar de `hasta` Y haber aguantado `minimo` segundos
+
+    Mientras dura, se levanta el suelo de la curva: los puntos por debajo de
+    `hasta` se suben a la velocidad que la curva pide en `desde`. El ventilador
+    sigue barriendo el disipador aunque el sensor ya marque poco.
+    """
+
+    def __init__(self):
+        self.activo = False
+        self.desde_cuando = 0.0
+        self.curva_puesta = None
+
+    def evaluar(self, cfg, perfil, media):
+        try:
+            desde = int(cfg.get("refresco_desde", 75))
+            hasta = int(cfg.get("refresco_hasta", 60))
+            minimo = int(cfg.get("refresco_minimo", 90))
+        except ValueError:
+            return None
+        if hasta >= desde or media is None:
+            return None
+
+        ahora = time.monotonic()
+        if not self.activo and media >= desde:
+            self.activo, self.desde_cuando = True, ahora
+        elif self.activo and media <= hasta and ahora - self.desde_cuando >= minimo:
+            self.activo = False
+
+        t = cfg.get(f"{perfil}_curva_t", "")
+        v = cfg.get(f"{perfil}_curva_v", "")
+        if not self.activo:
+            return (t, v)
+        try:
+            temps = [int(x) for x in t.split()]
+            vels = [int(x) for x in v.split()]
+        except ValueError:
+            return (t, v)
+        if len(temps) != 6 or len(vels) != 6:
+            return (t, v)
+        # Velocidad que la curva pide en `desde`: ese es el suelo mientras
+        # dure el enfriado.
+        suelo = vels[0]
+        for tt, vv in zip(temps, vels):
+            if tt <= desde:
+                suelo = vv
+        return (t, " ".join(str(max(x, suelo if temps[i] <= hasta else x))
+                            for i, x in enumerate(vels)))
+
+
+class Refuerzo:
+    """El refuerzo del ventilador (cooler boost), con media movil e histeresis.
+
+    Dos cosas que costaron caro y no hay que repetir:
+    - **El sensor se busca por etiqueta, nunca por indice de hwmon.** Los
+      numeros bailan entre arranques; una vez se estuvo hora y media leyendo la
+      tarjeta wifi (66 C) creyendo que era la CPU (95 C), y el refuerzo no
+      salto nunca.
+    - **No se decide hasta tener las diez muestras.** Con una sola lectura "la
+      media" es ese pico, y el refuerzo saltaba solo con reiniciar el servicio.
+    """
+
+    def __init__(self):
+        self.hist = collections.deque(maxlen=MUESTRAS)
+        self.nivel = "reposo"
+
+    def tic(self, manual):
+        f = os.path.join(hw.EC, "cooler_boost")
+        if not os.path.exists(f):
+            return None
+        if manual in ("on", "off"):
+            if hw.ec_get("cooler_boost") != manual:
+                hw.escribir(f, manual)
+            self.nivel = f"manual:{manual}"
+            return self.nivel
+
+        t = hw.temp_cpu()
+        if t is None:
+            return self.nivel
+        self.hist.append(t)
+        if len(self.hist) < MUESTRAS:
+            return self.nivel            # aun sin media fiable: no se toca nada
+        media = sum(self.hist) / len(self.hist)
+
+        nuevo = self.nivel
+        if self.nivel == "reposo" and media >= BOOST_SUBE_MEDIO:
+            nuevo = "medio"
+        elif self.nivel == "medio":
+            if media >= BOOST_SUBE_ALTO:
+                nuevo = "alto"
+            elif media < BOOST_BAJA_MEDIO:
+                nuevo = "reposo"
+        elif self.nivel == "alto" and media < BOOST_BAJA_ALTO:
+            nuevo = "medio"
+
+        if nuevo != self.nivel:
+            self.nivel = nuevo
+            print(f"{time.strftime('%H:%M:%S')}  refuerzo -> {nuevo}"
+                  f" ({media:.0f} C de media)", flush=True)
+        quiere = "on" if self.nivel in ("medio", "alto") else "off"
+        if hw.ec_get("cooler_boost") != quiere:
+            hw.escribir(f, quiere)
+        return self.nivel
+
+
+def vigilar_fan_mode(cfg, perfil):
+    """Mantiene el modo de ventilador que haya pedido el usuario.
+
+    Si eligio `advanced` hay que defenderlo: escribir la curva no basta, porque
+    en `auto` el EC usa la suya de fabrica y ni mira nuestros registros. Se vio
+    en caliente — a 72 C el ventilador daba 2926 rpm (48 %), clavado lo que
+    manda la curva de fabrica, mientras la nuestra pedia 65-78 %.
+
+    Pero si pidio `auto` o `silent`, se respeta: forzar `advanced` por encima
+    de su eleccion seria un control que no obedece.
+    """
+    if not hw.ec_disponible():
+        return
+    quiere = cfg.get("fan_mode", "advanced")
+    if quiere not in hw.ec_opciones("fan_mode") + ["advanced"]:
+        quiere = "advanced"
+    actual = hw.ec_get("fan_mode")
+    if actual == quiere:
+        return
+    hw.escribir(os.path.join(hw.EC, "fan_mode"), quiere)
+    if quiere == "advanced":
+        curva(cfg.get(f"{perfil}_curva_t", ""), cfg.get(f"{perfil}_curva_v", ""))
+    print(f"{time.strftime('%H:%M:%S')}  ventilador: {actual} -> {quiere}", flush=True)
+
+
+def ec_set(clave, valor, validos=None):
+    if not hw.ec_disponible() or valor is None:
+        return
+    if validos and valor not in validos:
+        return
+    if hw.ec_get(clave) != valor:
+        hw.escribir(os.path.join(hw.EC, clave), valor)
+
+
+def brillo_set(pct):
+    d = hw.retroiluminado()
+    if not d or pct is None:
+        return
+    try:
+        pct = int(pct)
+    except ValueError:
+        return
+    if not 5 <= pct <= 100:
+        return
+    mx = int(open(os.path.join(d, "max_brightness")).read())
+    hw.escribir(os.path.join(d, "brightness"), mx * pct // 100)
+
+
+def teclado_set(nivel):
+    d = hw.led_teclado()
+    if d and nivel is not None:
+        hw.escribir(os.path.join(d, "brightness"), nivel)
+
+
+def bateria_set(limite):
+    b = hw.bateria()
+    if not b or limite is None:
+        return
+    f = os.path.join(b["ruta"], "charge_control_end_threshold")
+    try:
+        limite = int(limite)
+    except ValueError:
+        return
+    if 50 <= limite <= 100 and b["limite"] != limite:
+        hw.escribir(f, limite)
+
+
+# ── Deteccion del perfil ────────────────────────────────────────────────────
+
+def corriendo(nombres):
+    for n in nombres.split():
+        if subprocess.run(["pgrep", "-x", n], capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def usa_gpu():
+    """Atajo barato primero: si la grafica duerme, nadie la usa, y eso es UN
+    fichero en vez de recorrer todos los procesos."""
+    d = hw.gpu_discreta()
+    if not d:
+        return False
+    if hw._leer(os.path.join(d, "power/runtime_status")) == "suspended":
+        return False
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if "/dev/nvidia" in os.readlink(fd):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def decidir(cfg):
+    m = cfg.get("modo", "auto")
+    if m in PERFILES:
+        return m
+    if corriendo(cfg.get("juego_procesos", "")) or usa_gpu():
+        return "juego"
+    if corriendo(cfg.get("trabajo_procesos", "")):
+        return "trabajo"
+    return "reposo"
+
+
+# ── Aplicar ─────────────────────────────────────────────────────────────────
+
+def guardar_respaldo():
+    """Antes de que fresco baje el brillo y apague los LEDs, se apunta como
+    estaban. Sin esto, salir de fresco te dejaba la pantalla a media luz — que
+    es exactamente el fallo que tenia la primera version."""
+    if os.path.exists(RESPALDO):
+        return
+    d, k = hw.retroiluminado(), hw.led_teclado()
+    datos = []
+    if d:
+        datos.append(f"brillo={hw._leer(os.path.join(d, 'brightness'))}")
+    if k:
+        datos.append(f"teclado={hw._leer(os.path.join(k, 'brightness'))}")
+    with open(RESPALDO, "w") as f:
+        f.write("\n".join(datos) + "\n")
+
+
+def restaurar_respaldo():
+    if not os.path.exists(RESPALDO):
+        return
+    vals = leer_config(RESPALDO)
+    d, k = hw.retroiluminado(), hw.led_teclado()
+    if d and "brillo" in vals:
+        hw.escribir(os.path.join(d, "brightness"), vals["brillo"])
+    if k and "teclado" in vals:
+        hw.escribir(os.path.join(k, "brightness"), vals["teclado"])
+    os.unlink(RESPALDO)
+
+
+def aplicar(perfil, cfg, anterior):
+    if perfil == "fresco" and anterior != "fresco":
+        guardar_respaldo()
+    if anterior == "fresco" and perfil != "fresco":
+        restaurar_respaldo()
+
+    techo(cfg.get(f"{perfil}_techo", 80))
+    curva(cfg.get(f"{perfil}_curva_t", ""), cfg.get(f"{perfil}_curva_v", ""))
+    ec_set("shift_mode", cfg.get(f"{perfil}_shift"), hw.ec_opciones("shift_mode"))
+
+    if perfil == "fresco":
+        brillo_set(cfg.get("fresco_brillo"))
+        teclado_set(cfg.get("fresco_teclado"))
+
+
+def aplicar_globales(cfg, prev):
+    """Ajustes que no dependen del perfil: bateria, super_battery, webcam.
+    Solo se tocan cuando el usuario los cambia, para no pelearse con nadie."""
+    for clave, fn in (("bateria_limite", bateria_set),):
+        if cfg.get(clave) != prev.get(clave):
+            fn(cfg.get(clave))
+    if cfg.get("super_bateria") != prev.get("super_bateria"):
+        ec_set("super_battery", cfg.get("super_bateria"), ("on", "off"))
+
+    # La camara son DOS registros y hay que mover los dos:
+    #   webcam        corta la alimentacion (desaparece /dev/video*)
+    #   webcam_block  es el que gobierna el LED de la tecla F6
+    # Tocando solo el primero la camara quedaba apagada pero el LED encendido,
+    # que es peor que no tener el control: el usuario no puede fiarse.
+    v = cfg.get("webcam")
+    if v != prev.get("webcam") or (v and hw.ec_get("webcam") != v):
+        ec_set("webcam", v, ("on", "off"))
+        ec_set("webcam_block", {"on": "off", "off": "on"}.get(v), ("on", "off"))
+    if cfg.get("fn_key") != prev.get("fn_key"):
+        ec_set("fn_key", cfg.get("fn_key"), ("left", "right"))
+    # El teclado retroiluminado solo se toca fuera de fresco: dentro de fresco
+    # lo maneja el perfil, y pelearse consigo mismo lo dejaria parpadeando.
+    if cfg.get("teclado") != prev.get("teclado") and cfg.get("modo") != "fresco":
+        teclado_set(cfg.get("teclado"))
+
+
+# ── Acciones de un solo tiro ────────────────────────────────────────────────
+# El usuario pide algo puntual escribiendo `accion=<nombre>` en la config; el
+# demonio lo ejecuta, deja el resultado en RESULTADO y borra la clave. Es la
+# unica forma de que la ventana (que no tiene permisos) lance algo que si los
+# necesita, sin abrir una via para ejecutar ordenes arbitrarias: solo valen
+# los nombres de esta tabla.
+RESULTADO = "/run/centro-resultado"
+
+
+def _resultado(txt):
+    try:
+        with open(RESULTADO, "w") as f:
+            f.write(txt)
+    except OSError:
+        pass
+
+
+def accion_probar_ventiladores():
+    """Sube los ventiladores a tope unos segundos y apunta hasta donde llega
+    cada uno. Sirve para saber si un ventilador que marca 0 rpm esta parado de
+    verdad o es que el sensor no lo publica."""
+    f = os.path.join(hw.EC, "cooler_boost")
+    if not os.path.exists(f):
+        _resultado("Este equipo no permite forzar los ventiladores.")
+        return
+    antes = hw.ec_get("cooler_boost")
+    _resultado("Probando…")
+    hw.escribir(f, "on")
+    picos = {}
+    for _ in range(16):
+        for etiqueta, rpm in hw.ventiladores():
+            picos[etiqueta] = max(picos.get(etiqueta, 0), rpm)
+        time.sleep(0.5)
+    hw.escribir(f, antes or "off")
+    vivos = {k: v for k, v in picos.items() if v > 0}
+    if not vivos:
+        _resultado("Ningun ventilador respondio. El sensor puede no publicarlos.")
+        return
+    lineas = [f"{k}: {v} rpm" for k, v in sorted(vivos.items())]
+    parados = [k for k, v in picos.items() if v == 0]
+    if parados:
+        lineas.append("Sin lectura: " + ", ".join(sorted(parados))
+                      + " (puede que no existan en este modelo)")
+    _resultado(" · ".join(lineas))
+
+
+def accion_liberar_memoria():
+    """Suelta la cache de disco. No acelera nada por si mismo —Linux ya usa
+    la RAM libre como cache a proposito— pero deja el contador de memoria
+    'usada' en su valor real, que es lo que la gente quiere ver."""
+    antes = hw.memoria()
+    try:
+        subprocess.run(["sync"], timeout=30)
+        hw.escribir("/proc/sys/vm/drop_caches", "3")
+    except Exception:
+        _resultado("No se pudo liberar la cache.")
+        return
+    time.sleep(1)
+    d = hw.memoria()
+    if antes and d:
+        _resultado(f"Memoria en uso: {antes['usada_gb']:.1f} GB -> {d['usada_gb']:.1f} GB")
+    else:
+        _resultado("Cache liberada.")
+
+
+def accion_prueba_esfuerzo():
+    """Carga el procesador un minuto y apunta hasta donde llega.
+
+    Es la prueba que de verdad dice si el equipo aguanta: temperatura maxima,
+    ventilador maximo y —lo que mas importa— si el procesador tuvo que
+    frenarse por calor, que es lo que se nota como tirones en un juego.
+    """
+    _resultado("Cargando el procesador…")
+    hilos = os.cpu_count() or 4
+    procs = [subprocess.Popen(["sh", "-c", "while :; do :; done"])
+             for _ in range(hilos)]
+    tmax = fmax = 0
+    freno_antes = _throttles()
+    try:
+        for _ in range(60):
+            t = hw.temp_cpu()
+            if t:
+                tmax = max(tmax, t)
+            for _e, rpm in hw.ventiladores():
+                fmax = max(fmax, rpm)
+            time.sleep(1)
+    finally:
+        for pr in procs:
+            pr.terminate()
+        for pr in procs:
+            try:
+                pr.wait(timeout=5)
+            except Exception:
+                pr.kill()
+    freno = _throttles() - freno_antes
+    partes = [f"Máxima {tmax} °C", f"ventilador {fmax} rpm"]
+    if freno > 0:
+        partes.append(f"se frenó por calor {freno} veces — el equipo no puede "
+                      f"sostener toda su potencia")
+    else:
+        partes.append("sin frenadas por calor: aguanta bien")
+    _resultado(" · ".join(partes))
+
+
+def _throttles():
+    """Cuantas veces se ha frenado el procesador por calor desde el arranque."""
+    n = 0
+    for f in glob.glob("/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"):
+        v = hw._leer(f)
+        if v and v.isdigit():
+            n += int(v)
+    return n
+
+
+def accion_curva_fabrica():
+    """Devuelve la curva que traia el equipo. Util si algo se tuerce y se
+    quiere volver a un punto conocido sin reinstalar nada."""
+    # La de fabrica de este chasis, documentada al medirla: es silenciosa pero
+    # no enfria — ni a 88 C pasa del 70 %.
+    if curva("55 64 73 76 82 88", "38 43 48 54 60 70"):
+        _resultado("Curva de fábrica puesta. Vuelve a elegir un perfil para "
+                   "recuperar la tuya.")
+    else:
+        _resultado("No se pudo escribir la curva.")
+
+
+ACCIONES = {
+    "prueba_esfuerzo": accion_prueba_esfuerzo,
+    "curva_fabrica": accion_curva_fabrica,
+    "probar_ventiladores": accion_probar_ventiladores,
+    "liberar_memoria": accion_liberar_memoria,
+}
+
+
+def atender_accion(cfg, ruta):
+    nombre = cfg.get("accion", "")
+    if not nombre:
+        return
+    fn = ACCIONES.get(nombre)
+    if fn:
+        # Se limpia ANTES de empezar: si no, la ventana enseña el resultado de
+        # la accion anterior como si fuera el de esta.
+        _resultado("Trabajando…")
+        print(f"{time.strftime('%H:%M:%S')}  accion: {nombre}", flush=True)
+        try:
+            fn()
+        except Exception as e:
+            _resultado(f"Fallo: {e}")
+    else:
+        _resultado("Accion desconocida.")
+    # La clave se borra siempre, tambien si fallo: si no, se repetiria en bucle.
+    try:
+        txt = open(ruta).read()
+        open(ruta, "w").write(txt.replace(f"accion={nombre}", "accion="))
+    except OSError:
+        pass
+
+
+def main():
+    ruta = ruta_config()
+    if not ruta:
+        print("no encuentro un usuario con sesion; nada que hacer", flush=True)
+        return 1
+    print(f"configuracion: {ruta}", flush=True)
+    actual, prev_cfg, prev_cfg_perfil, cfg = None, {}, {}, {}
+    refuerzo = Refuerzo()
+    enfriado = Enfriado()
+    proxima_revision = 0.0
+    marca = 0.0
+
+    while True:
+        ahora = time.monotonic()
+
+        # Si el fichero acaba de cambiar, no se espera al siguiente intervalo:
+        # el usuario acaba de tocar un interruptor y tiene que ver el efecto.
+        # Sin esto tardaba hasta 15 s y parecia que el control no funcionaba.
+        try:
+            m = os.path.getmtime(ruta)
+        except OSError:
+            m = marca
+        if m != marca:
+            marca = m
+            proxima_revision = 0.0
+
+        # --- releer y decidir perfil ---
+        if ahora >= proxima_revision:
+            cfg = leer_config(ruta)
+            nuevo = decidir(cfg)
+            if nuevo != actual:
+                aplicar(nuevo, cfg, actual)
+                enfriado.curva_puesta = None
+                print(f"{time.strftime('%H:%M:%S')}  {actual or 'arranque'} -> {nuevo}"
+                      f"  (techo {hw.techo_turbo()}%)", flush=True)
+                actual = nuevo
+            elif cfg != prev_cfg_perfil:
+                aplicar(nuevo, cfg, actual)   # cambiaron los ajustes del perfil vivo
+            prev_cfg_perfil = cfg
+            try:
+                proxima_revision = ahora + max(5, int(cfg.get("intervalo", 15)))
+            except ValueError:
+                proxima_revision = ahora + 15
+
+        # --- cada tic: atender al usuario y defender lo que otros sueltan ---
+        aplicar_globales(cfg, prev_cfg)
+        prev_cfg = cfg
+        if cfg.get("accion"):
+            atender_accion(cfg, ruta)
+            cfg = leer_config(ruta)
+            prev_cfg = cfg
+        if actual:
+            techo(cfg.get(f"{actual}_techo", 80))
+            vigilar_fan_mode(cfg, actual)
+        nivel = refuerzo.tic(cfg.get("refuerzo", "auto"))
+
+        # Enfriado prolongado: puede pedir una curva distinta de la del perfil.
+        media = (sum(refuerzo.hist) / len(refuerzo.hist)) if refuerzo.hist else None
+        quiere = enfriado.evaluar(cfg, actual, media) if actual else None
+        if quiere and quiere != enfriado.curva_puesta:
+            curva(*quiere)
+            enfriado.curva_puesta = quiere
+            if enfriado.activo:
+                print(f"{time.strftime('%H:%M:%S')}  enfriando: sigo soplando"
+                      f" ({media:.0f} C)", flush=True)
+
+        try:
+            with open(ESTADO, "w") as f:
+                f.write(f"perfil={actual}\nmodo={cfg.get('modo', 'auto')}\n"
+                        f"refuerzo={nivel or 'no disponible'}\n")
+        except OSError:
+            pass
+        time.sleep(TIC)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,98 @@
+# centro.conf — la unica verdad de Centro.
+#
+# Lo escriben la ventana y el widget de la barra; lo lee el demonio `centrod`,
+# que es lo unico que corre como root. Por eso nada de la interfaz pide
+# contraseña: aqui solo hay texto, y quien tiene permisos es el demonio.
+#
+# Se puede editar a mano. Se relee solo, no hace falta reiniciar nada.
+
+# auto = decide segun lo que tengas abierto.
+# juego / trabajo / reposo / fresco = fijado a mano, se ignora la deteccion.
+modo=auto
+
+# Cada cuantos segundos mira. Minimo 5.
+intervalo=15
+
+# Refuerzo del ventilador: auto (por temperatura) / on / off
+refuerzo=auto
+
+# ── Perfiles ────────────────────────────────────────────────────────────────
+# techo   tope del turbo en % (lo sostiene cpu-freno)
+# curva_t 6 temperaturas en °C, crecientes
+# curva_v 6 velocidades de ventilador en %, para los DOS ventiladores
+# shift   escenario del controlador embebido: turbo / comfort / eco
+
+juego_techo=80
+juego_curva_t=45 53 61 69 76 84
+juego_curva_v=45 58 70 82 90 100
+juego_shift=turbo
+
+trabajo_techo=80
+trabajo_curva_t=55 65 73 80 85 90
+trabajo_curva_v=33 42 55 72 88 100
+trabajo_shift=comfort
+
+reposo_techo=65
+reposo_curva_t=55 65 73 80 85 90
+reposo_curva_v=33 42 55 72 88 100
+reposo_shift=comfort
+
+# estable = sin bandazos. El techo del turbo se queda bajo para que no haya
+# picos de 95 C, y la curva arranca ya soplando y sube MUY despacio: el
+# ventilador se queda casi siempre en la misma velocidad en vez de subir y
+# bajar. Ni el equipo pega tirones ni el ruido cambia. No se elige solo: se
+# pone a mano cuando quieres que la maquina se comporte igual toda la tarde.
+estable_techo=70
+estable_curva_t=50 60 70 78 85 92
+estable_curva_v=48 54 62 72 86 100
+estable_shift=comfort
+
+# fresco = alivio cuando la habitacion aprieta. El unico que toca la pantalla
+# y el teclado; al salir los deja como estaban.
+fresco_techo=60
+fresco_curva_t=45 53 61 69 77 84
+fresco_curva_v=45 58 70 82 92 100
+fresco_shift=eco
+fresco_brillo=55
+fresco_teclado=0
+
+# ── Ajustes que no dependen del perfil ──────────────────────────────────────
+# Limite de carga de la bateria en %. 100 = sin limite. Dejarla siempre al
+# 100 la desgasta mas; 80 es el punto habitual si el equipo vive enchufado.
+bateria_limite=100
+
+# Ahorro extremo del controlador embebido (on/off).
+super_bateria=off
+
+# Camara (on/off). Apagarla aqui la desconecta de verdad, no es un aviso.
+webcam=on
+
+# ── Deteccion ───────────────────────────────────────────────────────────────
+# Nombres EXACTOS de proceso (los que da `pgrep -x`: el del ejecutable, no el
+# de la ventana). Separados por espacios.
+#
+# OJO: nada que corra siempre (node, go, docker...) o nunca se llegaria a
+# reposo.
+juego_procesos=steam steamwebhelper gamescope lutris heroic bottles wine wine64 winedevice
+trabajo_procesos=code codium zed idea goland pycharm webstorm android-studio
+
+# Modo del ventilador: advanced (usa la curva) / auto / silent
+fan_mode=advanced
+
+# Teclado retroiluminado fuera del perfil fresco: 0 a 3
+teclado=0
+
+# Tecla Fn: left / right
+fn_key=right
+
+# Acciones puntuales que lanza la ventana. El demonio la ejecuta y la borra.
+accion=
+
+# Enfriado prolongado: el ventilador sigue soplando despues de que baje la
+# temperatura, para sacar el calor que queda en el disipador.
+#   desde   grados a los que empieza
+#   hasta   grados a los que puede aflojar
+#   minimo  segundos que aguanta como minimo aunque ya haya bajado
+refresco_desde=75
+refresco_hasta=60
+refresco_minimo=90

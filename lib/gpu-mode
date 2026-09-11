@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Incorporado a Centro el 11/09/2026 desde el plugin nenadjokic.nvidia-hybrid.
+# Licencia MIT, Copyright (c) 2026 Dima Panov. Sin cambios en la logica: sabe
+# restaurar el valor original de la sesion en vez de inventarse un defecto.
+# Choose which GPU newly launched applications render on, on a hybrid machine.
+#
+# Omarchy starts apps through `uwsm-app`, which runs them as transient systemd
+# user units, so they inherit the user manager's environment. Setting the PRIME
+# offload variables there redirects every app started from that point on,
+# without root and without touching the compositor.
+#
+# Already-running applications keep the GPU they started on; only new launches
+# follow the mode. The compositor itself is never moved by this.
+#
+# Modes:
+#   auto    No override. OpenGL follows whatever the session already exports
+#           (Omarchy points it at the dGPU on NVIDIA machines) and Vulkan is
+#           left to the app. Linux has no per-application arbitration, so
+#           "auto" means "nothing forced", not "the system decides".
+#   nvidia  OpenGL and Vulkan both forced onto the dGPU.
+#   intel   Everything on the other GPU; the NVIDIA Vulkan driver is hidden as
+#           well, so a Vulkan app cannot reach the card behind your back.
+#
+# `auto` restores __GLX_VENDOR_LIBRARY_NAME from the value the session was
+# started with, recorded on first use, so this never invents a default.
+
+set -euo pipefail
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-gpu-mode"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/95-omarchy-gpu-mode.conf"
+BASELINE="$state_dir/session-glx-vendor"
+MANAGED=(__GLX_VENDOR_LIBRARY_NAME __NV_PRIME_RENDER_OFFLOAD __VK_LAYER_NV_optimus VK_LOADER_DRIVERS_DISABLE)
+
+env_value() {
+  systemctl --user show-environment 2>/dev/null | sed -n "s/^$1=//p" | tail -n 1
+}
+
+# Remember the session's own GLX vendor once, before any mode has touched it,
+# so `auto` can put it back instead of hardcoding "nvidia".
+record_baseline() {
+  [[ -f $BASELINE ]] && return 0
+  [[ -f $CONF ]] && return 0   # a mode is already applied; the value is not pristine
+  mkdir -p "$state_dir"
+  printf '%s\n' "$(env_value __GLX_VENDOR_LIBRARY_NAME)" >"$BASELINE"
+}
+
+baseline_value() {
+  [[ -f $BASELINE ]] && cat "$BASELINE" || true
+}
+
+persist() {
+  mkdir -p "$(dirname "$CONF")"
+  local tmp
+  tmp=$(mktemp "$CONF.XXXXXX")
+  printf '%s\n' "$@" >"$tmp"
+  mv -f "$tmp" "$CONF"   # atomic: a half-written file must never be sourced at login
+}
+
+clear_managed() {
+  systemctl --user unset-environment "${MANAGED[@]}"
+}
+
+use_auto() {
+  local base
+  base=$(baseline_value)
+  clear_managed
+  [[ -n $base ]] && systemctl --user set-environment "__GLX_VENDOR_LIBRARY_NAME=$base"
+  rm -f "$CONF"
+}
+
+use_nvidia() {
+  clear_managed
+  systemctl --user set-environment \
+    __GLX_VENDOR_LIBRARY_NAME=nvidia \
+    __NV_PRIME_RENDER_OFFLOAD=1 \
+    __VK_LAYER_NV_optimus=NVIDIA_only
+  persist \
+    "__GLX_VENDOR_LIBRARY_NAME=nvidia" \
+    "__NV_PRIME_RENDER_OFFLOAD=1" \
+    "__VK_LAYER_NV_optimus=NVIDIA_only"
+}
+
+use_other() {
+  clear_managed
+  systemctl --user set-environment \
+    __GLX_VENDOR_LIBRARY_NAME=mesa \
+    VK_LOADER_DRIVERS_DISABLE='*nvidia*'
+  persist \
+    "__GLX_VENDOR_LIBRARY_NAME=mesa" \
+    "VK_LOADER_DRIVERS_DISABLE=*nvidia*"
+}
+
+status() {
+  if [[ $(env_value __GLX_VENDOR_LIBRARY_NAME) == "mesa" ]]; then
+    echo intel
+  elif [[ $(env_value __NV_PRIME_RENDER_OFFLOAD) == "1" ]]; then
+    echo nvidia
+  else
+    echo auto
+  fi
+}
+
+# Name of the display device that is not the NVIDIA card. Empty output means
+# the machine has no second GPU, so none of the switching applies.
+integrated() {
+  command -v lspci >/dev/null 2>&1 || return 0
+  lspci -mm 2>/dev/null | awk '
+    $0 ~ /"(VGA compatible controller|3D controller|Display controller)"/ {
+      split($0, f, "\"")
+      vendor = f[4]; model = f[6]
+      if (vendor ~ /NVIDIA/) next
+      sub(/.*\[/, "", model); sub(/\].*/, "", model)
+      if (vendor ~ /Intel/) vendor = "Intel"
+      else if (vendor ~ /AMD|ATI|Advanced Micro/) vendor = "AMD"
+      else sub(/ .*/, "", vendor)
+      print (model ~ vendor) ? model : vendor " " model
+      exit
+    }'
+}
+
+case "${1:-status}" in
+  auto)   record_baseline; use_auto;   status ;;
+  nvidia) record_baseline; use_nvidia; status ;;
+  intel)  record_baseline; use_other;  status ;;
+  status) record_baseline; status ;;
+  igpu)   integrated ;;
+  path)   echo "$CONF" ;;
+  *)
+    echo "usage: gpu-mode [status|auto|nvidia|intel|igpu|path]" >&2
+    exit 2
+    ;;
+esac

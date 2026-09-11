@@ -1,0 +1,273 @@
+#!/bin/bash
+# Recolector de datos para el widget de barra de Centro.
+# Salida: key=value, una por linea. Todo sale de /proc y /sys, sin dependencias
+# externas y sin root.
+#
+# La NVIDIA no se toca aqui a proposito: la cuenta el widget
+# nenadjokic.nvidia-hybrid, y preguntarsela la despertaria. Este mide lo que de
+# verdad esta trabajando en reposo, que son la CPU y la GPU integrada Intel.
+#
+# Uso:
+#   hardware-stats        -> resumen barato para la barra
+#   hardware-stats full   -> anade uptime, procesos y temperatura de la wifi
+
+mode="${1:-bar}"
+
+state_dir="${XDG_RUNTIME_DIR:-/tmp}/centro-panel"
+mkdir -p "$state_dir"
+
+emit() { printf '%s=%s\n' "$1" "$2"; }
+
+# --- Localiza un hwmon por nombre; los indices cambian entre arranques ---
+hwmon_by_name() {
+  local want="$1" d
+  for d in /sys/class/hwmon/hwmon*; do
+    [[ -r "$d/name" ]] || continue
+    [[ "$(<"$d/name")" == "$want" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# --- CPU: delta contra la lectura anterior, sin sleep ---
+cpu_usage() {
+  local idle total prev_idle prev_total d_idle d_total pct
+  read -r idle total < <(awk 'NR==1{i=$5+$6; t=0; for(n=2;n<=NF;n++) t+=$n; print i, t}' /proc/stat)
+  if [[ -r "$state_dir/cpu" ]]; then
+    read -r prev_idle prev_total < "$state_dir/cpu"
+    d_idle=$((idle - prev_idle))
+    d_total=$((total - prev_total))
+    if (( d_total > 0 )); then
+      pct=$(( (100 * (d_total - d_idle) + d_total / 2) / d_total ))
+      (( pct < 0 )) && pct=0
+      (( pct > 100 )) && pct=100
+      emit cpu_pct "$pct"
+    fi
+  fi
+  printf '%s %s\n' "$idle" "$total" > "$state_dir/cpu"
+}
+
+cpu_usage
+
+emit cpu_cores "$(nproc)"
+
+# Frecuencia media actual, en MHz
+awk '/^cpu MHz/ { s += $4; n++ } END { if (n) printf "cpu_freq=%d\n", s / n }' /proc/cpuinfo
+
+# Temperatura del paquete de CPU
+if core=$(hwmon_by_name coretemp); then
+  for f in "$core"/temp*_label; do
+    [[ -r "$f" ]] || continue
+    if [[ "$(<"$f")" == Package* ]]; then
+      emit cpu_temp "$(( $(<"${f%_label}_input") / 1000 ))"
+      break
+    fi
+  done
+fi
+
+awk '{ printf "load1=%s\nload5=%s\nload15=%s\n", $1, $2, $3 }' /proc/loadavg
+
+# --- Memoria y swap ---
+awk '
+  /^MemTotal:/     { t = $2 }
+  /^MemAvailable:/ { a = $2 }
+  /^SwapTotal:/    { st = $2 }
+  /^SwapFree:/     { sf = $2 }
+  END {
+    if (t > 0) {
+      printf "mem_total=%.1f\nmem_used=%.1f\nmem_pct=%d\n", t/1048576, (t-a)/1048576, ((t-a)/t)*100
+    }
+    if (st > 0) printf "swap_used=%.1f\nswap_total=%.1f\nswap_pct=%d\n", (st-sf)/1048576, st/1048576, ((st-sf)/st)*100
+    else print "swap_total=0"
+  }
+' /proc/meminfo
+
+# --- Disco raiz ---
+df -B1 --output=size,used,pcent / 2>/dev/null | awk 'NR==2 {
+  gsub("%","",$3)
+  printf "disk_total=%.0f\ndisk_used=%.0f\ndisk_pct=%d\n", $1/1073741824, $2/1073741824, $3
+}'
+
+if nvme=$(hwmon_by_name nvme); then
+  [[ -r "$nvme/temp1_input" ]] && emit disk_temp "$(( $(<"$nvme/temp1_input") / 1000 ))"
+fi
+
+# --- Ventiladores (MSI expone fan1..fan4; solo interesan los que giran) ---
+for chip in msi_wmi_platform asus_wmi_sensors thinkpad; do
+  if fan=$(hwmon_by_name "$chip"); then
+    max=0
+    for f in "$fan"/fan*_input; do
+      [[ -r "$f" ]] || continue
+      v=$(<"$f")
+      (( v > max )) && max=$v
+    done
+    emit fan_rpm "$max"
+    break
+  fi
+done
+
+# --- Bateria ---
+for b in /sys/class/power_supply/BAT*; do
+  [[ -r "$b/capacity" ]] || continue
+  emit bat_pct "$(<"$b/capacity")"
+  emit bat_status "$(<"$b/status")"
+  if [[ -r "$b/power_now" ]]; then
+    awk -v w="$(<"$b/power_now")" 'BEGIN { if (w > 0) printf "bat_watts=%.1f\n", w/1000000 }'
+  elif [[ -r "$b/current_now" && -r "$b/voltage_now" ]]; then
+    awk -v c="$(<"$b/current_now")" -v v="$(<"$b/voltage_now")" \
+      'BEGIN { if (c > 0) printf "bat_watts=%.1f\n", (c/1000000)*(v/1000000) }'
+  fi
+  break
+done
+
+# --- GPU integrada Intel ---
+# El i915 no publica un porcentaje de uso como hace amdgpu con gpu_busy_percent,
+# y intel_gpu_top pide permisos de perf que aqui no hay. Lo que si publica, y sin
+# root, es rc6_residency_ms: los milisegundos que el motor grafico lleva dormido.
+# El resto del tiempo estuvo trabajando, asi que la actividad es el hueco que deja
+# el RC6 entre dos lecturas, igual que el uso de CPU sale del hueco que deja idle.
+igpu=""
+for d in /sys/class/drm/card*; do
+  [[ -r "$d/device/vendor" ]] || continue
+  [[ "$(<"$d/device/vendor")" == "0x8086" ]] || continue
+  igpu="$d"
+  break
+done
+
+if [[ -n "$igpu" ]]; then
+  # gt_act_freq_mhz es la frecuencia real de este instante y vale 0 en cuanto la
+  # GPU entra en RC6; gt_cur_freq_mhz es la que el driver tiene pedida y no baja
+  # a cero. Se muestra la real, y la pedida solo cuando la real es 0, para no
+  # ensenar "18% de uso a 0 MHz", que parece una averia y no lo es.
+  igpu_act=0
+  igpu_cur=0
+  [[ -r "$igpu/gt_act_freq_mhz" ]] && igpu_act=$(<"$igpu/gt_act_freq_mhz")
+  [[ -r "$igpu/gt_cur_freq_mhz" ]] && igpu_cur=$(<"$igpu/gt_cur_freq_mhz")
+  (( igpu_act > 0 )) && emit igpu_freq "$igpu_act" || emit igpu_freq "$igpu_cur"
+  [[ -r "$igpu/gt_max_freq_mhz" ]] && emit igpu_freq_max "$(<"$igpu/gt_max_freq_mhz")"
+
+  if [[ -r "$igpu/power/rc6_residency_ms" ]]; then
+    rc6=$(<"$igpu/power/rc6_residency_ms")
+    now_ms=$(( $(date +%s%N) / 1000000 ))
+    if [[ -r "$state_dir/igpu" ]]; then
+      read -r prev_rc6 prev_ms < "$state_dir/igpu"
+      d_rc6=$((rc6 - prev_rc6))
+      d_ms=$((now_ms - prev_ms))
+      # Menos de medio segundo no da una medida estable, y tras una suspension
+      # los dos contadores dejan de ser comparables: mejor no decir nada.
+      if (( d_ms >= 500 && d_rc6 >= 0 && d_rc6 <= d_ms + 200 )); then
+        pct=$(( 100 - (100 * d_rc6 + d_ms / 2) / d_ms ))
+        (( pct < 0 )) && pct=0
+        (( pct > 100 )) && pct=100
+        emit igpu_pct "$pct"
+      fi
+    fi
+    printf '%s %s\n' "$rc6" "$now_ms" > "$state_dir/igpu"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Añadido el 11/09/2026 al fusionar este widget con el de la NVIDIA.
+#
+# La regla de oro no cambia: NO se pregunta a nvidia-smi si la tarjeta duerme.
+# Sondearla cada pocos segundos la despertaria y tumbaria el ahorro (RTD3) que
+# se configuro ese mismo dia. El estado sale de sysfs, que es gratis; la
+# temperatura solo se pide si YA esta despierta, en cuyo caso preguntar no la
+# despierta de nuevo.
+# La ruta de la grafica dedicada se BUSCA: cablear 0000:01:00.0 funcionaba en
+# un equipo y en ninguno mas. Se localiza por clase (0x03 = video) y fabricante.
+GPU_PCI=""
+for d in /sys/bus/pci/devices/*; do
+  [[ -r "$d/class" && -r "$d/vendor" ]] || continue
+  [[ "$(<"$d/class")" == 0x03* ]] || continue
+  case "$(<"$d/vendor")" in 0x10de|0x1002) ;; *) continue ;; esac
+  [[ -r "$d/power/runtime_status" ]] && { GPU_PCI="$d"; break; }
+done
+
+gpu_run=$([[ -n "$GPU_PCI" ]] && cat "$GPU_PCI/power/runtime_status" 2>/dev/null || echo sin-grafica)
+emit nv_estado "$gpu_run"
+# Cuanto lleva dormida frente a despierta, para ver de un vistazo si RTD3 hace
+# su trabajo o si algo la esta manteniendo en vela.
+emit nv_dormida_ms "$(cat "$GPU_PCI/power/runtime_suspended_time" 2>/dev/null || echo 0)"
+emit nv_activa_ms  "$(cat "$GPU_PCI/power/runtime_active_time" 2>/dev/null || echo 0)"
+
+if [[ -n "$GPU_PCI" && "$gpu_run" != suspended ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  read -r nv_t nv_w < <(nvidia-smi --query-gpu=temperature.gpu,power.draw \
+      --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | tr ',' ' ')
+  [[ -n "${nv_t:-}" ]] && emit nv_temp "$nv_t"
+  [[ -n "${nv_w:-}" ]] && emit nv_watts "$nv_w"
+fi
+
+# Cuantos procesos la tienen abierta: distingue "despierta trabajando" de
+# "despierta sin que nadie la use", que es el fallo que se cazo el 11/09.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calor de TODA la maquina, no solo del procesador.
+#
+# Se recorren todos los hwmon y se emite cada sensor con su nombre, ademas del
+# maximo y de que pieza es. Mirar solo la CPU engaña: aqui el chipset (que va
+# con la wifi dentro) llega a estar mas caliente que ella, y no tiene
+# ventilador que lo enfrie.
+TMAX=0; TMAX_QUE=""
+for d in /sys/class/hwmon/hwmon*; do
+  [[ -r "$d/name" ]] || continue
+  hn="$(<"$d/name")"
+  for f in "$d"/temp*_input; do
+    [[ -r "$f" ]] || continue
+    v=$(( $(<"$f") / 1000 ))
+    (( v <= 0 || v > 150 )) && continue          # lecturas imposibles fuera
+    lf="${f%_input}_label"
+    et="$hn"
+    [[ -r "$lf" ]] && et="$(<"$lf")"
+    case "$et" in
+      "Package id 0") et="Procesador" ;;
+      Core*)          continue ;;                 # los nucleos sueltos no aportan
+      Composite)      et="Disco" ;;
+      "Sensor 1"|"Sensor 2") continue ;;
+      acpitz)         et="Placa" ;;
+      iwlwifi*)       et="Chipset" ;;
+      nvme)           et="Disco" ;;
+      coretemp)       et="Procesador" ;;
+    esac
+    emit "t_${et// /_}" "$v"
+    (( v > TMAX )) && { TMAX=$v; TMAX_QUE="$et"; }
+  done
+done
+# La grafica dedicada tambien cuenta, si esta despierta.
+if [[ -n "${nv_t:-}" ]] && (( nv_t > TMAX )); then TMAX=$nv_t; TMAX_QUE="Grafica"; fi
+emit temp_max "$TMAX"
+emit temp_max_que "$TMAX_QUE"
+
+[[ "$mode" == "bar" ]] && exit 0
+
+# ================= Solo en modo full =================
+
+awk '{ printf "uptime=%d\n", $1 }' /proc/uptime
+
+# Procesos que mas consumen. Se piden 6 y se recortan a 4 por si ps se cuela.
+ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -4 | awk '
+  { printf "top_cpu_%d=%s %s%%\n", NR, $2, $1 }'
+ps -eo pmem,comm --sort=-pmem --no-headers 2>/dev/null | head -4 | awk '
+  { printf "top_mem_%d=%s %s%%\n", NR, $2, $1 }'
+
+# Temperaturas sueltas que valga la pena mostrar
+if wifi=$(hwmon_by_name iwlwifi_1); then
+  [[ -r "$wifi/temp1_input" ]] && emit wifi_temp "$(( $(<"$wifi/temp1_input") / 1000 ))"
+fi
+
+emit nv_clientes "$(find /proc/[0-9]*/fd -lname '/dev/nvidia[0-9]*' 2>/dev/null | wc -l)"
+
+# Modo de GPU para apps nuevas (intel / auto / nvidia). Se delega en el script
+# del plugin nenadjokic, que es codigo probado y sabe restaurar el valor
+# original de la sesion en vez de inventarse un "nvidia" por defecto.
+GPU_MODE_SH="/usr/local/lib/centro/gpu-mode"
+[[ -x "$GPU_MODE_SH" ]] && emit gpu_modo "$("$GPU_MODE_SH" status 2>/dev/null | head -1)"
+
+# --- Perfil termico y techo del turbo (los pone perfil-auto) ---
+if [[ -r /run/centro-estado ]]; then
+  while IFS='=' read -r k v; do
+    [[ "$k" == perfil ]] && emit perfil "$v"
+    [[ "$k" == modo   ]] && emit perfil_modo "$v"
+  done < /run/centro-estado
+fi
+emit techo "$(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || echo 0)"

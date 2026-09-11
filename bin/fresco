@@ -1,0 +1,16 @@
+#!/bin/bash
+# fresco — atajo de terminal para cambiar el perfil de Centro.
+#
+# No configura nada por su cuenta: solo cambia una linea del fichero de Centro,
+# que es la unica verdad. El demonio `centrod` lo recoge y lo aplica.
+set -euo pipefail
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/centro/centro.conf"
+[[ -w "$CONF" ]] || { echo "no encuentro $CONF" >&2; exit 1; }
+poner() { sed -i "s/^modo=.*/modo=$1/" "$CONF"; echo "perfil -> $1"; }
+case "${1:-estado}" in
+  on|fresco)            poner fresco ;;
+  off|auto)             poner auto ;;
+  juego|trabajo|reposo) poner "$1" ;;
+  estado)               grep -E '^modo=' "$CONF"; cat /run/centro-estado 2>/dev/null ;;
+  *) echo "uso: fresco [on|off|juego|trabajo|reposo|estado]" >&2; exit 1 ;;
+esac

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Centro
+GenericName=Control del equipo
+Comment=Temperaturas, ventiladores, perfiles, batería y privacidad
+Exec=centro
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;Settings;HardwareSettings;
+Keywords=temperatura;ventilador;bateria;perfil;gpu;rendimiento;
+StartupWMClass=org.centro.Centro
