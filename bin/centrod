@@ -44,7 +44,6 @@ MUESTRAS = 15            # media movil; con una sola lectura "la media" es el pi
 # Registros de la curva en el EC de MSI. Seis puntos de temperatura y seis de
 # velocidad, para cada uno de los dos ventiladores.
 EC_IO = "/sys/kernel/debug/ec/ec0/io"
-REG = {"cpu_t": 0x6A, "cpu_v": 0x72, "gpu_t": 0x82, "gpu_v": 0x8A}
 
 
 class Vigia:
@@ -128,9 +127,17 @@ def leer_config(ruta):
 # ── Escrituras en el hardware ───────────────────────────────────────────────
 
 def curva(temps, velocs):
-    """Escribe la curva en los DOS ventiladores. Valores fuera de rango se
-    ignoran enteros: media curva aplicada es peor que ninguna."""
-    if not os.path.exists(EC_IO):
+    """Escribe la curva en los DOS ventiladores.
+
+    El mapa de registros sale del controlador que se haya DETECTADO. Si este
+    equipo no tiene uno conocido, no se escribe nada: meterse a ciegas en el
+    controlador de un portatil ajeno es la forma rapida de romperselo.
+
+    Valores fuera de rango se ignoran enteros: media curva aplicada es peor
+    que ninguna.
+    """
+    REG = hw.ec_curva()
+    if not REG or not os.path.exists(EC_IO):
         return False
     try:
         t = [int(x) for x in temps.split()]
@@ -155,7 +162,7 @@ def curva(temps, velocs):
     # Escribir la curva no basta: en modo "auto" el EC usa la suya de fabrica
     # y ni mira estos registros.
     if hw.ec_disponible() and hw.ec_get("fan_mode") != "advanced":
-        hw.escribir(os.path.join(hw.EC, "fan_mode"), "advanced")
+        hw.ec_escribir("fan_mode", "advanced")
     return True
 
 
@@ -176,9 +183,24 @@ def techo(pct):
         return
     if not 20 <= int(pct) <= 100:
         return
-    f = os.path.join(hw.PSTATE, "max_perf_pct")
-    if hw._leer(f) != pct:
-        hw.escribir(f, pct)
+    modo, ruta = hw.cpu_escalado()
+    if modo == "pstate":
+        f = os.path.join(ruta, "max_perf_pct")
+        if hw._leer(f) != pct:
+            hw.escribir(f, pct)
+    elif modo == "frecuencia":
+        # Sin `pstate` se limita por frecuencia, que existe en cualquier
+        # equipo. Se calcula sobre el rango real del chip, no sobre el maximo
+        # a secas: dejar el tope por debajo de la frecuencia minima seria
+        # pedirle algo que no puede dar.
+        for c in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq"):
+            lo = hw._int(os.path.join(c, "cpuinfo_min_freq"))
+            hi = hw._int(os.path.join(c, "cpuinfo_max_freq"))
+            if not lo or not hi:
+                continue
+            objetivo = lo + (hi - lo) * int(pct) // 100
+            if hw._leer(os.path.join(c, "scaling_max_freq")) != str(objetivo):
+                hw.escribir(os.path.join(c, "scaling_max_freq"), objetivo)
     for epp in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"):
         if hw._leer(epp) != "balance_performance":
             hw.escribir(epp, "balance_performance")
@@ -260,12 +282,11 @@ class Refuerzo:
         self.nivel = "reposo"
 
     def tic(self, manual):
-        f = os.path.join(hw.EC, "cooler_boost")
-        if not os.path.exists(f):
+        if hw.ec_get("cooler_boost") is None:
             return None
         if manual in ("on", "off"):
             if hw.ec_get("cooler_boost") != manual:
-                hw.escribir(f, manual)
+                hw.ec_escribir("cooler_boost", manual)
             self.nivel = f"manual:{manual}"
             return self.nivel
 
@@ -294,7 +315,7 @@ class Refuerzo:
                   f" ({media:.0f} C de media)", flush=True)
         quiere = "on" if self.nivel in ("medio", "alto") else "off"
         if hw.ec_get("cooler_boost") != quiere:
-            hw.escribir(f, quiere)
+            hw.ec_escribir("cooler_boost", quiere)
         return self.nivel
 
 
@@ -317,7 +338,7 @@ def vigilar_fan_mode(cfg, perfil):
     actual = hw.ec_get("fan_mode")
     if actual == quiere:
         return
-    hw.escribir(os.path.join(hw.EC, "fan_mode"), quiere)
+    hw.ec_escribir("fan_mode", quiere)
     if quiere == "advanced":
         curva(cfg.get(f"{perfil}_curva_t", ""), cfg.get(f"{perfil}_curva_v", ""))
     print(f"{time.strftime('%H:%M:%S')}  ventilador: {actual} -> {quiere}", flush=True)
@@ -329,7 +350,7 @@ def ec_set(clave, valor, validos=None):
     if validos and valor not in validos:
         return
     if hw.ec_get(clave) != valor:
-        hw.escribir(os.path.join(hw.EC, clave), valor)
+        hw.ec_escribir(clave, valor)
 
 
 def brillo_set(pct):
@@ -366,6 +387,9 @@ def _en_horario(desde, hasta):
     return (ini <= m or m < fin) if ini > fin else (ini <= m < fin)
 
 
+_TECLADO = {"puesto": None, "noche": None}
+
+
 def teclado_auto(cfg, perfil):
     """Enciende la luz del teclado de noche y la apaga de dia.
 
@@ -390,10 +414,20 @@ def teclado_auto(cfg, perfil):
         return None
     mx = int(hw._leer(os.path.join(d, "max_brightness")) or 3)
     nivel = max(0, min(mx, nivel))
-    if hw._leer(os.path.join(d, "brightness")) != str(nivel):
+    actual = hw._leer(os.path.join(d, "brightness"))
+
+    # Si el valor de ahora no es el que pusimos nosotros, lo cambio el usuario
+    # con la tecla del teclado. Se respeta hasta el siguiente cambio de tramo
+    # (anochecer o amanecer): pisarlo cada dos segundos seria pelearse con el.
+    if (_TECLADO["puesto"] is not None and actual != str(_TECLADO["puesto"])
+            and noche == _TECLADO["noche"]):
+        return None
+
+    if actual != str(nivel):
         hw.escribir(os.path.join(d, "brightness"), nivel)
         print(f"{time.strftime('%H:%M:%S')}  teclado -> {nivel}"
               f" ({'noche' if noche else 'dia'})", flush=True)
+    _TECLADO["puesto"], _TECLADO["noche"] = nivel, noche
     return nivel
 
 
@@ -492,24 +526,70 @@ def aplicar(perfil, cfg, anterior):
         teclado_set(cfg.get("fresco_teclado"))
 
 
+def escribir_config(ruta, cambios):
+    """Cambia claves del fichero conservando los comentarios, que explican el
+    porque de cada ajuste."""
+    import re
+    try:
+        lineas = open(ruta).readlines()
+    except OSError:
+        return
+    pend = dict(cambios)
+    out = []
+    for l in lineas:
+        m = re.match(r"^\s*([a-z_]+)\s*=", l)
+        if m and m.group(1) in pend:
+            out.append(f"{m.group(1)}={pend.pop(m.group(1))}\n")
+        else:
+            out.append(l)
+    out += [f"{k}={v}\n" for k, v in pend.items()]
+    tmp = ruta + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(out)
+    os.replace(tmp, ruta)
+    # El fichero es del usuario: si lo escribe root hay que devolverselo o la
+    # ventana ya no podria guardar.
+    u = hw.usuario_grafico()
+    if u:
+        try:
+            os.chown(ruta, u.pw_uid, u.pw_gid)
+        except OSError:
+            pass
+
+
 def aplicar_globales(cfg, prev):
     """Ajustes que no dependen del perfil: bateria, super_battery, webcam.
     Solo se tocan cuando el usuario los cambia, para no pelearse con nadie."""
     for clave, fn in (("bateria_limite", bateria_set),):
         if cfg.get(clave) != prev.get(clave):
             fn(cfg.get(clave))
-    if cfg.get("super_bateria") != prev.get("super_bateria"):
-        ec_set("super_battery", cfg.get("super_bateria"), ("on", "off"))
-
-    # La camara son DOS registros y hay que mover los dos:
-    #   webcam        corta la alimentacion (desaparece /dev/video*)
-    #   webcam_block  es el que gobierna el LED de la tecla F6
-    # Tocando solo el primero la camara quedaba apagada pero el LED encendido,
-    # que es peor que no tener el control: el usuario no puede fiarse.
-    v = cfg.get("webcam")
-    if v != prev.get("webcam") or (v and hw.ec_get("webcam") != v):
-        ec_set("webcam", v, ("on", "off"))
-        ec_set("webcam_block", {"on": "off", "off": "on"}.get(v), ("on", "off"))
+    # Estos ajustes van en LOS DOS SENTIDOS, y el sentido importa:
+    #
+    #   cambia el fichero  -> se aplica al hardware
+    #   cambia el hardware -> el fichero lo ADOPTA
+    #
+    # Lo segundo es lo que respeta las teclas Fn. La primera version repontia
+    # el hardware al valor del fichero en cuanto se desviaban, asi que pulsar
+    # Fn+F6 apagaba la camara y el demonio la volvia a encender medio segundo
+    # despues. Una tecla del teclado es el usuario hablando: manda ella.
+    for clave, registro in (("super_bateria", "super_battery"),
+                            ("webcam", "webcam"),
+                            ("fn_key", "fn_key")):
+        deseado = cfg.get(clave)
+        actual = hw.ec_get(registro)
+        if actual is None:
+            continue
+        if deseado != prev.get(clave):
+            ec_set(registro, deseado, None)
+            # La camara son DOS registros: `webcam` corta la alimentacion y
+            # `webcam_block` gobierna el piloto de la tecla. Tocando solo uno,
+            # la camara quedaba apagada con el piloto encendido.
+            if clave == "webcam":
+                ec_set("webcam_block", {"on": "off", "off": "on"}.get(deseado), None)
+        elif deseado is not None and actual != deseado:
+            escribir_config(_RUTA[0], {clave: actual})
+            print(f"{time.strftime('%H:%M:%S')}  {clave}: lo cambiaste en el"
+                  f" equipo -> {actual}", flush=True)
     if cfg.get("fn_key") != prev.get("fn_key"):
         ec_set("fn_key", cfg.get("fn_key"), ("left", "right"))
     # El teclado retroiluminado solo se toca fuera de fresco: dentro de fresco
@@ -541,19 +621,18 @@ def accion_probar_ventiladores():
     """Sube los ventiladores a tope unos segundos y apunta hasta donde llega
     cada uno. Sirve para saber si un ventilador que marca 0 rpm esta parado de
     verdad o es que el sensor no lo publica."""
-    f = os.path.join(hw.EC, "cooler_boost")
-    if not os.path.exists(f):
+    if hw.ec_get("cooler_boost") is None:
         _resultado("Este equipo no permite forzar los ventiladores.")
         return
     antes = hw.ec_get("cooler_boost")
     _resultado("Probando…")
-    hw.escribir(f, "on")
+    hw.ec_escribir("cooler_boost", "on")
     picos = {}
     for _ in range(16):
         for etiqueta, rpm in hw.ventiladores():
             picos[etiqueta] = max(picos.get(etiqueta, 0), rpm)
         time.sleep(0.5)
-    hw.escribir(f, antes or "off")
+    hw.ec_escribir("cooler_boost", antes or "off")
     vivos = {k: v for k, v in picos.items() if v > 0}
     if not vivos:
         _resultado("Ningun ventilador respondio. El sensor puede no publicarlos.")
@@ -678,8 +757,12 @@ def atender_accion(cfg, ruta):
         pass
 
 
+_RUTA = [None]
+
+
 def main():
     ruta = ruta_config()
+    _RUTA[0] = ruta
     if not ruta:
         print("no encuentro un usuario con sesion; nada que hacer", flush=True)
         return 1

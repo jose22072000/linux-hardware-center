@@ -69,6 +69,28 @@ entera.
 
 ![Widget de barra](docs/img/barra.png)
 
+## Primero mira qué tienes, después decide qué enseñar
+
+Nada está dado por hecho. Antes de dibujar un solo control, `hw.py` busca:
+
+| | cómo se busca |
+|---|---|
+| Controlador del equipo | por driver (`msi-ec`, `asus-nb-wmi`, `thinkpad_acpi`, `hp-wmi`, `ideapad_laptop`) |
+| Curva del ventilador | solo si se conoce el mapa de registros de ese controlador |
+| Tope del procesador | `intel_pstate` o `amd_pstate` si están; si no, por frecuencia |
+| Sensores | por familia (`coretemp`, `k10temp`, `iwlwifi`, `ath*`, `nvme`, `amdgpu`…), y lo que no esté en la tabla sale con su propio nombre |
+| Gráficas | por clase PCI y fabricante, no por una ruta fija |
+| Batería, retroiluminado, luz del teclado | buscados, no supuestos |
+
+**Lo que tu equipo no tenga, no aparece.** Ni un botón que no haga nada, ni una
+cifra a `—` fija. Y si el controlador embebido no es de los que tienen mapa de
+curva conocido, se usa todo lo demás pero la curva no se ofrece: escribir a
+ciegas en el controlador de un portátil ajeno es la forma rápida de romperlo.
+
+**Las teclas Fn mandan.** Si apagas la cámara con Fn+F6 o subes la luz del
+teclado con su tecla, el programa lo adopta en vez de deshacerlo. Una tecla del
+teclado es el usuario hablando.
+
 ## Cómo está hecho
 
 ```

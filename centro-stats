@@ -209,6 +209,7 @@ fi
 # con la wifi dentro) llega a estar mas caliente que ella, y no tiene
 # ventilador que lo enfrie.
 TMAX=0; TMAX_QUE=""
+declare -A VISTOS=()
 for d in /sys/class/hwmon/hwmon*; do
   [[ -r "$d/name" ]] || continue
   hn="$(<"$d/name")"
@@ -219,22 +220,34 @@ for d in /sys/class/hwmon/hwmon*; do
     lf="${f%_input}_label"
     et="$hn"
     [[ -r "$lf" ]] && et="$(<"$lf")"
+    # Por FAMILIA, no por fabricante: "iwlwifi" solo existe si la wifi es
+    # Intel, y en otro equipo ese sensor se quedaba sin nombre. Lo que no
+    # este en la tabla sale con su propio nombre en vez de desaparecer.
     case "$et" in
+      Core*|"Sensor 1"|"Sensor 2") continue ;;     # los nucleos sueltos no aportan
       "Package id 0") et="Procesador" ;;
-      Core*)          continue ;;                 # los nucleos sueltos no aportan
       Composite)      et="Disco" ;;
-      "Sensor 1"|"Sensor 2") continue ;;
-      acpitz)         et="Placa" ;;
-      iwlwifi*)       et="Chipset" ;;
-      nvme)           et="Disco" ;;
-      coretemp)       et="Procesador" ;;
     esac
-    emit "t_${et// /_}" "$v"
+    case "$hn" in
+      coretemp|k10temp|zenpower|cpu_thermal) et="Procesador" ;;
+      iwlwifi*|ath*|mt79*|rtw*)              et="Wifi" ;;
+      nvme|drivetemp)                        et="Disco" ;;
+      acpitz|pch_*)                          et="Placa" ;;
+      amdgpu|radeon|i915|xe)                 et="Grafica" ;;
+    esac
+    # Una familia puede tener varios sensores —dos discos, por ejemplo— y
+    # emitir la clave dos veces dejaba un valor pisando al otro. Se queda el
+    # mas caliente, que es el que interesa vigilar.
+    clave="t_${et// /_}"
+    anterior="${VISTOS[$clave]:-0}"
+    (( v > anterior )) || continue
+    VISTOS[$clave]=$v
     (( v > TMAX )) && { TMAX=$v; TMAX_QUE="$et"; }
   done
 done
 # La grafica dedicada tambien cuenta, si esta despierta.
 if [[ -n "${nv_t:-}" ]] && (( nv_t > TMAX )); then TMAX=$nv_t; TMAX_QUE="Grafica"; fi
+for clave in "${!VISTOS[@]}"; do emit "$clave" "${VISTOS[$clave]}"; done
 emit temp_max "$TMAX"
 emit temp_max_que "$TMAX_QUE"
 
@@ -251,7 +264,13 @@ ps -eo pmem,comm --sort=-pmem --no-headers 2>/dev/null | head -4 | awk '
   { printf "top_mem_%d=%s %s%%\n", NR, $2, $1 }'
 
 # Temperaturas sueltas que valga la pena mostrar
-if wifi=$(hwmon_by_name iwlwifi_1); then
+# La wifi, buscada por familia y no por el nombre de un driver concreto.
+wifi=""
+for d in /sys/class/hwmon/hwmon*; do
+  [[ -r "$d/name" ]] || continue
+  case "$(<"$d/name")" in iwlwifi*|ath*|mt79*|rtw*) wifi="$d"; break ;; esac
+done
+if [[ -n "$wifi" ]]; then
   [[ -r "$wifi/temp1_input" ]] && emit wifi_temp "$(( $(<"$wifi/temp1_input") / 1000 ))"
 fi
 

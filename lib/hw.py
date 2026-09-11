@@ -166,18 +166,77 @@ def _clientes_gpu():
             pass
     return n
 
-# ── Controlador embebido (MSI y equivalentes) ───────────────────────────────
-EC = "/sys/devices/platform/msi-ec"
+# ── Controlador embebido ────────────────────────────────────────────────────
+#
+# Cada fabricante expone el suyo con otro nombre y otro mapa de registros para
+# la curva del ventilador. Aqui van los que se conocen; añadir uno nuevo es
+# añadir una fila a esta tabla, no tocar codigo.
+#
+#   curva: posicion de los seis puntos de temperatura y los seis de velocidad,
+#          para el ventilador del procesador y el de la grafica. None = este
+#          controlador no deja tocar la curva y la interfaz no la ofrece.
+CONTROLADORES = {
+    "msi-ec": {
+        "nombre": "MSI",
+        "curva": {"cpu_t": 0x6A, "cpu_v": 0x72, "gpu_t": 0x82, "gpu_v": 0x8A},
+    },
+    # Sin mapa de curva confirmado: se usa lo demas (escenario, bateria,
+    # camara) pero NO se ofrece la curva, que escribir a ciegas en el
+    # controlador de un portatil ajeno es la forma rapida de romperselo.
+    "asus-nb-wmi": {"nombre": "ASUS", "curva": None},
+    "ideapad_laptop": {"nombre": "Lenovo IdeaPad", "curva": None},
+    "thinkpad_acpi": {"nombre": "ThinkPad", "curva": None},
+    "hp-wmi": {"nombre": "HP", "curva": None},
+}
+
+_cache_ec = {}
+
+def ec_info():
+    """Qué controlador embebido tiene este equipo, si tiene alguno."""
+    if _cache_ec:
+        return _cache_ec.get("v")
+    _cache_ec["v"] = None
+    for driver, datos in CONTROLADORES.items():
+        ruta = f"/sys/devices/platform/{driver}"
+        if os.path.isdir(ruta):
+            _cache_ec["v"] = dict(datos, driver=driver, ruta=ruta)
+            break
+    return _cache_ec["v"]
+
+
+def _ec_ruta():
+    i = ec_info()
+    return i["ruta"] if i else None
+
+
+# Compatibilidad: mucho codigo lo usa como una constante.
+class _RutaEC(str):
+    def __new__(cls):
+        return super().__new__(cls, _ec_ruta() or "/nonexistent")
+
 
 def ec_disponible():
-    return os.path.isdir(EC)
+    return ec_info() is not None
 
 def ec_get(clave):
-    return _leer(os.path.join(EC, clave))
+    r = _ec_ruta()
+    return _leer(os.path.join(r, clave)) if r else None
 
 def ec_opciones(clave):
-    v = _leer(os.path.join(EC, f"available_{clave}s"))
+    r = _ec_ruta()
+    if not r:
+        return []
+    v = _leer(os.path.join(r, f"available_{clave}s"))
     return v.split() if v else []
+
+def ec_escribir(clave, valor):
+    r = _ec_ruta()
+    return escribir(os.path.join(r, clave), valor) if r else False
+
+def ec_curva():
+    """Mapa de registros de la curva, o None si este controlador no lo tiene."""
+    i = ec_info()
+    return i["curva"] if i else None
 
 # ── Bateria ─────────────────────────────────────────────────────────────────
 
@@ -215,10 +274,40 @@ def led_teclado():
     return None
 
 # ── Procesador ──────────────────────────────────────────────────────────────
-PSTATE = "/sys/devices/system/cpu/intel_pstate"
+#
+# `max_perf_pct` es un invento de los drivers `pstate` de Intel y AMD; un
+# equipo con `acpi-cpufreq` (bastantes AMD y todo lo viejo) no lo tiene, y
+# darlo por hecho dejaba el tope del procesador sin funcionar en esas
+# maquinas. Ahi se limita por frecuencia, que existe siempre.
+_cache_cpu = {}
+
+def cpu_escalado():
+    """('pstate', ruta) o ('frecuencia', None) o (None, None)."""
+    if _cache_cpu:
+        return _cache_cpu["v"]
+    v = (None, None)
+    for d in ("intel_pstate", "amd_pstate"):
+        ruta = f"/sys/devices/system/cpu/{d}"
+        if os.path.exists(os.path.join(ruta, "max_perf_pct")):
+            v = ("pstate", ruta)
+            break
+    else:
+        if glob.glob("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"):
+            v = ("frecuencia", None)
+    _cache_cpu["v"] = v
+    return v
+
 
 def techo_turbo():
-    return _int(os.path.join(PSTATE, "max_perf_pct"))
+    """Tope actual en % del maximo, sea cual sea la forma de limitarlo."""
+    modo, ruta = cpu_escalado()
+    if modo == "pstate":
+        return _int(os.path.join(ruta, "max_perf_pct"))
+    if modo == "frecuencia":
+        act = _int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+        top = _int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        return round(100 * act / top) if act and top else None
+    return None
 
 def cpu_modelo():
     for l in _leer("/proc/cpuinfo", "").split("\n"):
@@ -464,3 +553,69 @@ def gpu_nombre():
         return None
     v = _leer(os.path.join(d, "vendor"))
     return {"0x10de": "NVIDIA", "0x1002": "AMD"}.get(v, "Dedicada")
+
+
+# ── Sensores con nombre entendible, sea cual sea el fabricante ──────────────
+#
+# Traducir `iwlwifi_1` a "Chipset" estaba bien para una wifi Intel y mal para
+# todo lo demas. Aqui la tabla es por FAMILIA, y lo que no este en ella sale
+# con su propio nombre en vez de desaparecer: mas vale un nombre feo que un
+# sensor que no se ve.
+FAMILIAS = (
+    (("coretemp", "k10temp", "zenpower", "cpu_thermal"), "Procesador"),
+    (("iwlwifi", "ath1", "ath10k", "ath11k", "mt7921", "rtw"), "Wifi"),
+    (("nvme", "drivetemp"), "Disco"),
+    (("acpitz", "pch_"), "Placa"),
+    (("amdgpu", "radeon", "i915", "xe"), "Grafica"),
+    (("BAT", "bat"), "Bateria"),
+)
+
+
+def _familia(nombre, etiqueta):
+    for claves, bonito in FAMILIAS:
+        if any(nombre.startswith(k) for k in claves):
+            return bonito
+    # Etiquetas que ya vienen legibles del propio sensor
+    if etiqueta and not etiqueta.startswith(("temp", "Sensor")):
+        return etiqueta
+    return nombre
+
+
+def sensores():
+    """[(nombre, °C)] de todo lo que mida temperatura en este equipo.
+
+    Se descartan los nucleos sueltos —ya esta el del paquete— y las lecturas
+    imposibles, que algun sensor devuelve basura cuando el dispositivo duerme.
+    """
+    out, vistos = [], set()
+    for nombre, d in _hwmon().items():
+        for f in sorted(glob.glob(os.path.join(d, "temp*_input"))):
+            v = _int(f, div=1000)
+            if v is None or v <= 0 or v > 150:
+                continue
+            et = _leer(f.replace("_input", "_label"), "")
+            if et.startswith("Core ") or et in ("Sensor 1", "Sensor 2"):
+                continue
+            if et == "Package id 0":
+                et = ""
+            bonito = _familia(nombre, et)
+            if bonito in vistos:
+                continue
+            vistos.add(bonito)
+            out.append((bonito, v))
+    return sorted(out, key=lambda x: -x[1])
+
+
+def sensor_mas_caliente():
+    s = sensores()
+    return s[0] if s else (None, None)
+
+
+def igpu_nombre():
+    """Nombre del fabricante de la integrada, para no llamarla "Intel" en un
+    equipo que lleva una AMD."""
+    d = gpu_integrada()
+    if not d:
+        return None
+    v = _leer(os.path.join(d, "device/vendor"))
+    return {"0x8086": "Intel", "0x1002": "AMD"}.get(v, "Integrada")

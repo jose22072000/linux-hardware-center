@@ -311,7 +311,7 @@ class Ventana(Adw.ApplicationWindow):
         aguja("cpu_t", "Procesador", "°C", 100, 75, 88)
         aguja("cpu_u", "Uso", "%", 100, 85, 96)
         if hw.gpu_integrada():
-            aguja("igpu", "Gráfica Intel", "%", 100)
+            aguja("igpu", hw.igpu_nombre() or "Integrada", "%", 100)
         if hw.gpu_discreta():
             aguja("gpu", hw.gpu_nombre() or "Dedicada", "°C", 100, 70, 85)
         if hw.ventiladores():
@@ -335,7 +335,7 @@ class Ventana(Adw.ApplicationWindow):
         metricas = [("cpu_t", "Temperatura", "°", 100, 85),
                     ("cpu_u", "Uso del procesador", "%", 100, None)]
         if hw.gpu_integrada():
-            metricas.append(("igpu", "Gráfica integrada", "%", 100, None))
+            metricas.append(("igpu", f"Gráfica {hw.igpu_nombre() or 'integrada'}", "%", 100, None))
         if hw.ventiladores():
             metricas.append(("fan", "Ventilador", "", 6000, None))
         for clave, titulo, unidad, maximo, aviso in metricas:
@@ -599,11 +599,20 @@ class Ventana(Adw.ApplicationWindow):
         datos = [("Procesador", hw.cpu_modelo()),
                  ("Memoria", f"{m['total_gb']:.0f} GB" if m else "—")]
         if self.hay_ec:
-            datos.append(("Firmware", hw.ec_get("fw_version") or "—"))
-            datos.append(("Fecha del firmware", hw.ec_get("fw_release_date") or "—"))
+            i = hw.ec_info()
+            datos.append(("Controlador del equipo",
+                          f"{i['nombre']} ({i['driver']})"
+                          + ("" if i["curva"] else " · sin control de curva")))
+            if hw.ec_get("fw_version"):
+                datos.append(("Firmware", hw.ec_get("fw_version")))
         if self.bat and self.bat["salud"]:
             datos.append(("Salud de la batería",
                           f"{self.bat['salud']} % de su capacidad original"))
+        modo, _ = hw.cpu_escalado()
+        datos.append(("Tope del procesador",
+                      {"pstate": "por porcentaje (pstate)",
+                       "frecuencia": "por frecuencia"}.get(modo,
+                       "no se puede limitar en este equipo")))
         if not self.hay_ec:
             datos.append(("Control de ventiladores",
                           "este equipo no expone un controlador compatible"))
@@ -926,11 +935,10 @@ class Ventana(Adw.ApplicationWindow):
             else:
                 self.agujas["gpu"].poner(gt, texto_alt=None if gt else "—")
 
-        otros = []
-        for nombre, pref in (("Wifi", "iwlwifi"), ("Disco", "nvme")):
-            v = hw.temp_por_nombre(pref)
-            if v:
-                otros.append(f"{nombre} {v} °C")
+        # Se enumera lo que este equipo TENGA, en vez de preguntar por los
+        # sensores concretos de una maquina. Se salta el procesador porque ya
+        # tiene su propio medidor arriba.
+        otros = [f"{n} {v} °C" for n, v in hw.sensores() if n != "Procesador"]
         m = hw.memoria()
         if m:
             otros.append(f"Memoria {m['usada_gb']:.1f} de {m['total_gb']:.0f} GB")
