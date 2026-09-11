@@ -159,6 +159,51 @@ def escribir_en(dfd, nombre, datos, modo, uid, gid):
             os.close(fd)
 
 
+# Un fichero del proyecto son kilobytes. El tope esta para que nadie haga
+# que root se trague algo enorme por un enlace o un fichero cambiado.
+TOPE_ORIGEN = 8 * 1024 * 1024
+
+
+def leer_bajo(dfd, relativo, tope=TOPE_ORIGEN):
+    """Lee `relativo` colgando de un descriptor ya retenido.
+
+    Cada componente se abre sin seguir enlaces, no solo el ultimo: si no, una
+    carpeta intermedia cambiada por un enlace basta para sacar a root del
+    arbol que se valido. Y se lee con tope de tamaño.
+    """
+    partes = [p for p in relativo.split("/") if p and p != "."]
+    if not partes or ".." in partes:
+        raise Inseguro(f"origen no valido: {relativo!r}")
+    propio = None
+    try:
+        for parte in partes[:-1]:
+            nuevo = os.open(parte, _ABRIR | os.O_DIRECTORY,
+                            dir_fd=propio if propio is not None else dfd)
+            if propio is not None:
+                os.close(propio)
+            propio = nuevo
+        fd = os.open(partes[-1], _ABRIR,
+                     dir_fd=propio if propio is not None else dfd)
+    finally:
+        if propio is not None:
+            os.close(propio)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Inseguro(f"{relativo} no es un fichero normal")
+        if st.st_size > tope:
+            raise Inseguro(f"{relativo} pasa del tope ({st.st_size} bytes)")
+        datos = b""
+        while len(datos) <= tope:
+            trozo = os.read(fd, 1 << 20)
+            if not trozo:
+                return datos
+            datos += trozo
+        raise Inseguro(f"{relativo} crecio mientras se leia")
+    finally:
+        os.close(fd)
+
+
 def existe_en(dfd, nombre):
     try:
         os.lstat(nombre, dir_fd=dfd)
@@ -207,16 +252,23 @@ def _escribible_por_otros(st):
     return bool(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
 
 
-def _abrir_dir_del_sistema(ruta):
+def abrir_carpeta_sistema(ruta, crear=False):
     """Descriptor de una carpeta del sistema, validando todo el camino desde
-    la raiz. No se siguen enlaces: si un componente lo es, se rechaza."""
+    la raiz: cada componente carpeta, de root y no escribible por grupo ni por
+    otros. No se siguen enlaces: si un componente lo es, se rechaza."""
     dfd = os.open("/", _ABRIR | os.O_DIRECTORY)
     try:
         st = os.fstat(dfd)
         if st.st_uid != 0 or _escribible_por_otros(st):
             raise Inseguro("la raiz no es de root o es escribible")
         for parte in ruta.strip("/").split("/"):
-            nuevo = os.open(parte, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
+            try:
+                nuevo = os.open(parte, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
+            except FileNotFoundError:
+                if not crear:
+                    raise
+                os.mkdir(parte, 0o755, dir_fd=dfd)
+                nuevo = os.open(parte, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
             os.close(dfd)
             dfd = nuevo
             st = os.fstat(dfd)
@@ -230,6 +282,9 @@ def _abrir_dir_del_sistema(ruta):
         os.close(dfd)
         raise
     return dfd
+
+
+_abrir_dir_del_sistema = abrir_carpeta_sistema
 
 
 def _resolver(dfd, carpeta, nombre, saltos=0):

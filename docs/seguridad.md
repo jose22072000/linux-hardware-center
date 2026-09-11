@@ -31,6 +31,8 @@ una sentada. `bin/centrod` no abre por nombre ningun fichero del usuario.
 | Temporal con nombre aleatorio, `O_CREAT\|O_EXCL\|O_NOFOLLOW` | el viejo `centro.conf.tmp`, que era predecible |
 | `fchown`/`fchmod` **sobre el descriptor** y antes del renombrado | cambiar el fichero por un enlace entre el `rename` y el `chown` |
 | `os.replace` con `src_dir_fd`/`dst_dir_fd` | mover la carpeta a media escritura |
+| Origen abierto una vez y leido del descriptor validado | cambiar el fichero entre mirarlo y copiarlo |
+| Tope de tamaño en el origen | hacer que root se trague algo enorme |
 
 El descriptor apunta al inodo, no al nombre: aunque renombren la carpeta o
 dejen un enlace en su sitio, se sigue escribiendo donde se abrio.
@@ -110,8 +112,49 @@ Comprobado con la trampa puesta: con `~/.config/omarchy/plugins/centro.panel`
 convertido en un enlace a una carpeta de `/root`, la instalacion **se niega,
 lo explica y no toca la victima**, y el resto queda instalado igual.
 
-Un detalle que costo un intento: `programa()` devuelve **la ruta pedida**, no
-el final de la cadena de enlaces. `lsmod` y `modprobe` son enlaces a `kmod`,
+### El origen tambien es del usuario
+
+El destino no era la mitad peligrosa: el **origen** es la carpeta de trabajo
+de quien instala, y root la lee. Un enlace dentro del arbol hacia que root
+copiara a sitios legibles un fichero que solo root puede leer, y un fichero
+cambiado entre el momento de mirarlo y el de copiarlo se colaba igual.
+
+`bin/centro-copiar` abre el arbol de origen **una sola vez** y retiene su
+descriptor; todas las lecturas cuelgan de ahi, componente a componente con
+`O_NOFOLLOW` —no solo el ultimo— exigiendo fichero regular y con tope de
+tamaño. El contenido se lee **del mismo descriptor que se comprobo**, asi que
+lo copiado es lo validado. Y la copia se hace de una vez para las dos mitades,
+sistema y casa, en una sola pasada.
+
+El instalador va en dos fases por eso mismo:
+
+1. el ayudante del arbol de trabajo se instala a si mismo y a `seguro.py` en
+   `/usr/local/lib/centro`, que es de root;
+2. **todo lo demas lo hace ya la copia de root**, que el usuario no puede
+   cambiar entre paso y paso.
+
+### Lo que no se puede cerrar, y se dice
+
+Quien escribe `sudo ./instalar.sh` esta pidiendo que root ejecute ese arbol.
+Eso no lo arregla ninguna comprobacion: es la decision de instalar. Lo que si
+se acota es **cuanto dura esa confianza** — una fase, dos ficheros — y que a
+partir de ahi no se vuelva a tocar nada del arbol sin validarlo.
+
+Los ficheros de `/run` (`centro-estado`, `centro-resultado`,
+`centro-respaldo`) los escribe el demonio por su nombre a proposito: `/run` es
+de root y solo root escribe ahi, asi que no hay nada que un usuario pueda
+plantar. Lo mismo vale para sysfs y para el EC.
+
+Y una frontera de diseño, que no es un fallo pero conviene saberla: el demonio
+atiende la configuracion del **usuario con sesion grafica**, y el hardware es
+uno solo. En una maquina compartida, ese usuario decide la curva del
+ventilador y el techo del procesador para todos. Es inherente a lo que hace el
+programa, no un descuido.
+
+### Un detalle que costo un intento
+
+`programa()` devuelve **la ruta pedida**, no el final de la cadena de
+enlaces. `lsmod` y `modprobe` son enlaces a `kmod`,
 que mira su propio `argv[0]`; llamandolo `/usr/bin/kmod` se quedaba escupiendo
 la ayuda. Lo que importa es haber comprobado a donde lleva el enlace, no
 llamar por el otro nombre.

@@ -85,7 +85,11 @@ if [[ -z $CASA ]]; then
 fi
 CONF="$CASA/.config/centro"
 
-en_casa() { "$PY" "$AQUI/bin/centro-en-casa" "$USUARIO" "$@"; }
+# El ayudante que hace TODAS las copias. Se usa el instalado en
+# /usr/local/lib/centro —de root— en cuanto existe; el del arbol de trabajo
+# solo para ponerlo ahi, que es el unico momento en que no hay otra cosa.
+AYUDANTE_ROOT=/usr/local/lib/centro/centro-copiar
+copiar() { "$PY" "${1:-$AYUDANTE_ROOT}" "$AQUI" "$USUARIO" "${@:2}"; }
 
 necesita_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -112,34 +116,35 @@ instalar() {
   necesita_root
   comprobar
 
+  # Fase 1: el ayudante y su libreria, puestos con el ayudante del arbol de
+  # trabajo. Es la unica vez que root ejecuta algo de ahi, y es inevitable:
+  # es el mismo arbol del que ya se esta ejecutando este guion.
   info "librerias -> /usr/local/lib/centro"
-  "$INSTALL" -d -m 755 /usr/local/lib/centro
-  "$INSTALL" -m 644 "$AQUI/lib/hw.py" "$AQUI/lib/widgets.py" \
-                    "$AQUI/lib/seguro.py" /usr/local/lib/centro/
-  "$INSTALL" -m 755 "$AQUI/lib/gpu-mode" "$AQUI/bin/centro-en-casa" \
-                    /usr/local/lib/centro/
+  copiar "$AQUI/bin/centro-copiar" plan <<'PLAN'
+sistema lib/seguro.py     /usr/local/lib/centro/seguro.py      644
+sistema bin/centro-copiar /usr/local/lib/centro/centro-copiar  755
+PLAN
+
+  # Fase 2: de aqui en adelante solo el de root, que ya nadie puede cambiar.
+  if [[ ! -x $AYUDANTE_ROOT ]]; then
+    rojo "no se pudo instalar el ayudante privilegiado"
+    exit 1
+  fi
 
   info "demonio -> /usr/local/bin/centrod"
-  "$INSTALL" -m 755 "$AQUI/bin/centrod" /usr/local/bin/centrod
-
   info "ventana y atajo -> $CASA/.local/bin"
-  en_casa copiar "$AQUI/bin/centro"  .local/bin/centro  755
-  en_casa copiar "$AQUI/bin/fresco"  .local/bin/fresco  755
-
   info "lanzador"
-  en_casa copiar "$AQUI/org.centro.Centro.desktop" \
-          .local/share/applications/org.centro.Centro.desktop 644
-
-  # La configuracion NO se sobreescribe: es del usuario y puede llevar horas
-  # de ajustes. El ayudante devuelve 3 si ya estaba.
-  local r=0
-  en_casa copiar-si-falta "$AQUI/docs/centro.conf.ejemplo" \
-          .config/centro/centro.conf 644 || r=$?
-  case $r in
-    0) info "configuracion nueva en $CONF/centro.conf" ;;
-    3) info "configuracion ya existente: se respeta" ;;
-    *) rojo "no pude dejar la configuracion"; exit 1 ;;
-  esac
+  copiar "" plan <<'PLAN'
+sistema lib/hw.py               /usr/local/lib/centro/hw.py            644
+sistema lib/widgets.py          /usr/local/lib/centro/widgets.py       644
+sistema lib/gpu-mode            /usr/local/lib/centro/gpu-mode         755
+sistema bin/centrod             /usr/local/bin/centrod                 755
+sistema systemd/centrod.service /etc/systemd/system/centrod.service    644
+casa bin/centro                    .local/bin/centro                             755
+casa bin/fresco                    .local/bin/fresco                             755
+casa org.centro.Centro.desktop     .local/share/applications/org.centro.Centro.desktop 644
+casa-si-falta docs/centro.conf.ejemplo .config/centro/centro.conf                644
+PLAN
 
   # El widget de barra es solo para Omarchy; en otro escritorio se salta.
   #
@@ -147,20 +152,18 @@ instalar() {
   #   `omarchy plugin add <url>`  ya dejo el repo EN la carpeta de plugins, y
   #                               entonces no hay nada que copiar
   #   `git clone` a mano          hay que copiar el widget a su sitio
-  if en_casa hay-carpeta .config/omarchy/plugins; then
-    DESTINO="$(en_casa ruta .config/omarchy/plugins/centro.panel)"
+  if copiar "" hay-carpeta .config/omarchy/plugins; then
+    DESTINO="$(copiar "" ruta .config/omarchy/plugins/centro.panel)"
     if [[ -d $DESTINO && $AQUI -ef $DESTINO ]]; then
       info "widget de barra: ya esta en su sitio"
     else
-      info "widget de barra (Omarchy)"
       # Que un destino trucado no tumbe el resto: lo demas ya esta puesto.
-      local base=.config/omarchy/plugins/centro.panel
-      if ! { en_casa copiar "$AQUI/manifest.json"  "$base/manifest.json"  644 &&
-             en_casa copiar "$AQUI/Panel.qml"      "$base/Panel.qml"      644 &&
-             en_casa copiar "$AQUI/centro-stats"   "$base/centro-stats"   755; }
-      then
-        rojo "  no pude dejar el widget en su sitio; el resto si quedo instalado"
-      fi
+      info "widget de barra (Omarchy)"
+      copiar "" plan <<'PLAN' || rojo "  el resto si quedo instalado"
+casa manifest.json .config/omarchy/plugins/centro.panel/manifest.json 644 opcional
+casa Panel.qml     .config/omarchy/plugins/centro.panel/Panel.qml     644 opcional
+casa centro-stats  .config/omarchy/plugins/centro.panel/centro-stats  755 opcional
+PLAN
     fi
     echo "     para verlo en la barra:  omarchy plugin enable centro.panel"
   fi
@@ -173,7 +176,6 @@ instalar() {
   printf 'drivetemp\n' > /etc/modules-load.d/drivetemp.conf
 
   info "servicio"
-  "$INSTALL" -m 644 "$AQUI/systemd/centrod.service" /etc/systemd/system/
   "$SYSTEMCTL" daemon-reload
   "$SYSTEMCTL" enable --now centrod
 
@@ -189,12 +191,17 @@ desinstalar() {
   "$SYSTEMCTL" disable --now centrod 2>/dev/null || true
   "$RM" -f /etc/systemd/system/centrod.service /etc/modules-load.d/drivetemp.conf
   "$SYSTEMCTL" daemon-reload
+  # Con el ayudante de root si esta; si ya no, con el del arbol de trabajo.
+  local ayudante="$AYUDANTE_ROOT"
+  [[ -x $ayudante ]] || ayudante="$AQUI/bin/centro-copiar"
+  copiar "$ayudante" plan <<'PLAN' || true
+borrar-casa - .local/bin/centro
+borrar-casa - .local/bin/fresco
+borrar-casa - .local/share/applications/org.centro.Centro.desktop
+borrar-casa - .config/omarchy/plugins/centro.panel
+PLAN
   "$RM" -rf /usr/local/lib/centro
   "$RM" -f /usr/local/bin/centrod
-  en_casa borrar .local/bin/centro
-  en_casa borrar .local/bin/fresco
-  en_casa borrar .local/share/applications/org.centro.Centro.desktop
-  en_casa borrar .config/omarchy/plugins/centro.panel
   echo
   verde "Desinstalado."
   echo "  Tu configuracion sigue en $CONF por si vuelves."

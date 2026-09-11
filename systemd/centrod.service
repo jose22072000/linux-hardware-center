@@ -25,7 +25,9 @@ Environment=PATH=/usr/bin
 UMask=0022
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/run /home /root
+# /var/home es donde viven las casas en los sistemas con /home enlazado
+# (Silverblue y parientes). Si no esta, systemd lo ignora.
+ReadWritePaths=/run /home /root -/var/home
 PrivateTmp=yes
 # No habla con la red por ningun sitio; que no pueda.
 PrivateNetwork=yes

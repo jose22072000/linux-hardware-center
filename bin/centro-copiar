@@ -1,0 +1,191 @@
+#!/usr/bin/python3
+"""Copia privilegiada: del arbol de origen a su sitio, sin fiarse de ninguno.
+
+El instalador corre como root con dos lados peligrosos:
+
+  el ORIGEN  es la carpeta de trabajo del usuario. Root la lee, y el usuario
+             puede cambiarla entre paso y paso: un enlace en medio, o el
+             fichero sustituido despues de mirarlo.
+  el DESTINO es en parte del usuario tambien (`~/.local/bin`, `~/.config`).
+
+La regla es la misma en los dos lados: **abrir una vez, retener el descriptor
+y trabajar colgando de el, sin seguir enlaces**. El arbol de origen se abre
+UNA sola vez al empezar y todas las lecturas cuelgan de ese descriptor, asi
+que aunque renombren la carpeta a mitad se sigue leyendo la que se valido.
+Cada componente se abre con O_NOFOLLOW, no solo el ultimo, y con tope de
+tamaño.
+
+El plan viene por la entrada, una orden por linea:
+
+    sistema       <origen-rel> <destino-absoluto> <modo> [opcional]
+    casa          <origen-rel> <destino-relativo> <modo> [opcional]
+    casa-si-falta <origen-rel> <destino-relativo> <modo> [opcional]
+    borrar-casa    -          <destino-relativo>
+    borrar-sistema -          <destino-absoluto>
+
+Y sueltas, para lo que el guion necesita preguntar:
+
+    centro-copiar <raiz> <usuario> hay-carpeta <relativo>
+    centro-copiar <raiz> <usuario> ruta        <relativo>
+"""
+import os, sys, pwd, stat
+
+# La libreria se busca al lado del propio ayudante ANTES que en el sistema:
+# el del arbol de trabajo tiene que usar la suya, o al instalarse a si mismo
+# acabaria hablando con la version vieja ya instalada.
+_AQUI = os.path.dirname(os.path.realpath(__file__))
+for _d in (_AQUI, os.path.join(os.path.dirname(_AQUI), "lib"),
+           "/usr/local/lib/centro"):
+    if os.path.isfile(os.path.join(_d, "seguro.py")):
+        sys.path.insert(0, _d)
+        break
+else:
+    sys.exit("centro-copiar: no encuentro seguro.py junto a mi ni instalado;"
+             " el arbol de trabajo esta incompleto o cambiado")
+import seguro
+
+ROJO, FIN = "\033[31m", "\033[0m"
+
+
+def aviso(txt):
+    print(f"  {txt}", flush=True)
+
+
+def falla(txt):
+    print(f"{ROJO}  {txt}{FIN}", file=sys.stderr, flush=True)
+
+
+def partir(rel):
+    rel = rel.strip("/")
+    if not rel or ".." in rel.split("/"):
+        raise seguro.Inseguro(f"destino no valido: {rel!r}")
+    carpeta, _, nombre = rel.rpartition("/")
+    return carpeta, nombre
+
+
+class Copiador:
+    def __init__(self, raiz, usuario):
+        # El arbol de origen, UNA vez. A partir de aqui todo cuelga de aqui.
+        self.raiz = os.open(raiz, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.u = pwd.getpwnam(usuario)
+        self.carpetas = {}          # cache de descriptores de destino
+
+    def cerrar(self):
+        for fd in self.carpetas.values():
+            os.close(fd)
+        os.close(self.raiz)
+
+    def _casa(self, rel, crear=False):
+        clave = ("casa", rel)
+        if clave not in self.carpetas:
+            self.carpetas[clave] = seguro.abrir_carpeta(
+                os.path.join(self.u.pw_dir, rel.strip("/")) if rel else self.u.pw_dir,
+                self.u.pw_uid, self.u.pw_gid, crear=crear)
+        return self.carpetas[clave]
+
+    def _sistema(self, ruta, crear=False):
+        clave = ("sistema", ruta)
+        if clave not in self.carpetas:
+            self.carpetas[clave] = seguro.abrir_carpeta_sistema(ruta, crear=crear)
+        return self.carpetas[clave]
+
+    def hacer(self, orden, origen, destino, modo):
+        if orden == "sistema":
+            carpeta, nombre = os.path.split(destino)
+            dfd = self._sistema(carpeta, crear=True)
+            datos = seguro.leer_bajo(self.raiz, origen)
+            if not seguro.escribir_en(dfd, nombre, datos, modo, 0, 0):
+                raise OSError(f"no se pudo escribir {destino}")
+            return True
+
+        if orden in ("casa", "casa-si-falta"):
+            carpeta, nombre = partir(destino)
+            dfd = self._casa(carpeta, crear=True)
+            if orden == "casa-si-falta" and seguro.existe_en(dfd, nombre):
+                aviso(f"ya existe, se respeta: ~/{destino}")
+                return True
+            datos = seguro.leer_bajo(self.raiz, origen)
+            if not seguro.escribir_en(dfd, nombre, datos, modo,
+                                      self.u.pw_uid, self.u.pw_gid):
+                raise OSError(f"no se pudo escribir ~/{destino}")
+            return True
+
+        if orden == "borrar-casa":
+            carpeta, nombre = partir(destino)
+            try:
+                dfd = self._casa(carpeta)
+            except (OSError, seguro.Inseguro):
+                return True                      # no esta: nada que borrar
+            seguro.borrar_en(dfd, nombre)
+            return True
+
+        if orden == "borrar-sistema":
+            carpeta, nombre = os.path.split(destino)
+            try:
+                dfd = self._sistema(carpeta)
+            except (OSError, seguro.Inseguro):
+                return True
+            seguro.borrar_en(dfd, nombre)
+            return True
+
+        raise seguro.Inseguro(f"orden desconocida: {orden}")
+
+
+def main(argv):
+    if len(argv) < 4:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    raiz, usuario, orden = argv[1], argv[2], argv[3]
+    try:
+        u = pwd.getpwnam(usuario)
+    except KeyError:
+        falla(f"no existe el usuario {usuario}")
+        return 1
+
+    if orden == "ruta":
+        print(os.path.join(u.pw_dir, argv[4].strip("/")))
+        return 0
+
+    if orden == "hay-carpeta":
+        try:
+            fd = seguro.abrir_carpeta(os.path.join(u.pw_dir, argv[4].strip("/")),
+                                      u.pw_uid, u.pw_gid)
+        except (OSError, seguro.Inseguro):
+            return 1
+        os.close(fd)
+        return 0
+
+    if orden != "plan":
+        falla(f"orden desconocida: {orden}")
+        return 2
+
+    try:
+        c = Copiador(raiz, usuario)
+    except (OSError, KeyError) as e:
+        falla(f"no puedo abrir el arbol de origen: {e}")
+        return 1
+
+    fallos = 0
+    try:
+        for linea in sys.stdin:
+            linea = linea.strip()
+            if not linea or linea.startswith("#"):
+                continue
+            campos = linea.split()
+            orden, origen, destino = campos[0], campos[1], campos[2]
+            modo = int(campos[3], 8) if len(campos) > 3 else 0
+            opcional = "opcional" in campos[4:]
+            try:
+                c.hacer(orden, origen, destino, modo)
+            except (OSError, seguro.Inseguro, ValueError) as e:
+                falla(f"{destino}: {e}")
+                if not opcional:
+                    return 1
+                fallos += 1
+    finally:
+        c.cerrar()
+    return 1 if fallos else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
