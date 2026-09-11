@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """centrod — el demonio de Centro. Lo unico de este proyecto que corre como root.
 
 Diseño, en una frase: **toda la escritura privilegiada esta aqui y en ningun
@@ -26,8 +26,10 @@ import hw, seguro
 
 # Programas que lanza root. Por nombre suelto los buscaria el PATH heredado;
 # se resuelven una vez contra rutas del sistema. Ver `lib/seguro.py`.
+# Sin respaldo a ciegas: si no se puede verificar, no se lanza. Un
+# `or sys.executable` seleccionaba un interprete sin comprobar nada.
 PGREP = seguro.programa("pgrep")
-PYTHON = seguro.programa("python3") or sys.executable
+PYTHON = seguro.programa("python3")
 
 ESTADO = "/run/centro-estado"
 RESPALDO = "/run/centro-respaldo"       # brillo/teclado antes de entrar en fresco
@@ -475,7 +477,8 @@ def corriendo(nombres):
     if not PGREP:
         return False
     for n in nombres.split():
-        if subprocess.run([PGREP, "-x", n], capture_output=True).returncode == 0:
+        if subprocess.run([PGREP, "-x", n], capture_output=True,
+                          env=seguro.ENTORNO).returncode == 0:
             return True
     return False
 
@@ -694,12 +697,17 @@ def accion_prueba_esfuerzo():
     ventilador maximo y —lo que mas importa— si el procesador tuvo que
     frenarse por calor, que es lo que se nota como tirones en un juego.
     """
+    if not PYTHON:
+        _resultado("No hay un interprete de confianza con el que cargar el "
+                   "procesador.")
+        return
     _resultado("Cargando el procesador…")
     hilos = os.cpu_count() or 4
     procs = [subprocess.Popen([PYTHON, "-c", "while True: pass"],
                               stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL)
+                              stderr=subprocess.DEVNULL,
+                              env=seguro.ENTORNO, close_fds=True)
              for _ in range(hilos)]
     tmax = fmax = 0
     freno_antes = _throttles()

@@ -5,7 +5,9 @@ Wants=cpu-freno.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/centrod
+# Interprete fijo y de confianza: sin esto el shebang lo elegiria el
+# PATH, que es justo lo que no puede decidir quien corre como root.
+ExecStart=/usr/bin/python3 /usr/local/bin/centrod
 Restart=on-failure
 RestartSec=10
 
@@ -19,7 +21,7 @@ RestartSec=10
 #
 # PATH fijo: sin esto se hereda, y un PATH heredado decide que binario se
 # ejecuta. Los programas se resuelven ademas por ruta absoluta en el codigo.
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/usr/bin
 UMask=0022
 NoNewPrivileges=yes
 ProtectSystem=strict

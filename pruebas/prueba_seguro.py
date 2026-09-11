@@ -58,11 +58,29 @@ try:
 except OSError as e:
     ok(f"el kernel ya lo impide ({e.strerror})")
 
-# 6 — programas por ruta absoluta
+# 6 — programas: ruta absoluta, sin enlaces y solo de carpetas de root
 print("6. programas")
 p = seguro.programa("pgrep")
 ok(f"pgrep -> {p}") if p and p.startswith("/") else mal("no resuelve pgrep")
 ok("no inventa programas") if seguro.programa("no-existe-esto") is None else mal("invento uno")
+
+py = seguro.programa("python3")
+ok(f"python3 resuelto sin enlaces -> {py}") if py and not os.path.islink(py) else mal("devuelve un enlace")
+
+# Un ejecutable del usuario colado en el camino no puede pasar por bueno
+propio = os.path.join(base, "pgrep")
+open(propio, "w").write("#!/bin/sh\nexit 0\n")
+os.chmod(propio, 0o755)
+seguro._FIABLES = (base,) + seguro._FIABLES
+try:
+    r = seguro.programa("pgrep")
+    ok(f"ignora la carpeta que no es de root ({r})") if r and r.startswith("/usr") else mal(f"acepto {r}")
+finally:
+    seguro._FIABLES = seguro._FIABLES[1:]
+
+# Un enlace que no es de root tampoco
+import tempfile as _t
+ok("entorno minimo") if set(seguro.ENTORNO) <= {"PATH", "LC_ALL"} else mal("el entorno hereda cosas")
 
 print(f"\n{'TODO BIEN' if fallos == 0 else str(fallos) + ' FALLOS'}")
 sys.exit(1 if fallos else 0)

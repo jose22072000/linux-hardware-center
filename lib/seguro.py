@@ -142,22 +142,91 @@ class Fichero:
 
 
 # ── Programas que lanza root ────────────────────────────────────────────────
-# Por nombre suelto los buscaria el PATH, y el PATH se hereda. Se resuelven
-# una vez contra carpetas del sistema y se comprueba que son de root.
+# Por nombre suelto los busca el PATH, y el PATH se hereda. Se resuelven una
+# vez, sin seguir enlaces a ciegas: cada carpeta del camino tiene que ser de
+# root y no escribible ni por grupo ni por otros, y un enlace solo vale si es
+# de root y apunta a un vecino de su misma carpeta ya validada.
 
-_FIABLES = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+_FIABLES = ("/usr/bin", "/usr/sbin", "/bin", "/sbin")
+_MAX_SALTOS = 8
+
+# Entorno minimo para lo que lanza root: nada heredado.
+ENTORNO = {"PATH": "/usr/bin", "LC_ALL": "C.UTF-8"}
+
+
+def _escribible_por_otros(st):
+    return bool(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _abrir_dir_del_sistema(ruta):
+    """Descriptor de una carpeta del sistema, validando todo el camino desde
+    la raiz. No se siguen enlaces: si un componente lo es, se rechaza."""
+    dfd = os.open("/", _ABRIR | os.O_DIRECTORY)
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != 0 or _escribible_por_otros(st):
+            raise Inseguro("la raiz no es de root o es escribible")
+        for parte in ruta.strip("/").split("/"):
+            nuevo = os.open(parte, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nuevo
+            st = os.fstat(dfd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise Inseguro(f"{parte} no es carpeta")
+            if st.st_uid != 0:
+                raise Inseguro(f"{parte} no es de root")
+            if _escribible_por_otros(st):
+                raise Inseguro(f"{parte} es escribible por grupo u otros")
+    except Exception:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def _resolver(dfd, carpeta, nombre, saltos=0):
+    """Nombre final, ya sin enlaces, dentro de `carpeta`."""
+    if saltos > _MAX_SALTOS:
+        raise Inseguro("demasiados enlaces")
+    st = os.lstat(nombre, dir_fd=dfd)
+    if stat.S_ISLNK(st.st_mode):
+        # Un enlace de root dentro de una carpeta que solo root escribe es
+        # tan de fiar como el fichero; de cualquier otro, no.
+        if st.st_uid != 0:
+            raise Inseguro(f"{nombre} es un enlace que no es de root")
+        destino = os.readlink(nombre, dir_fd=dfd)
+        if "/" in destino:
+            # Saltar de carpeta obligaria a revalidar otro camino entero;
+            # aqui no hace falta y no se admite.
+            raise Inseguro(f"{nombre} apunta fuera de {carpeta}")
+        return _resolver(dfd, carpeta, destino, saltos + 1)
+    return nombre
 
 
 def programa(nombre):
-    """Ruta absoluta de confianza, o None si no aparece."""
-    for d in _FIABLES:
-        p = os.path.join(d, nombre)
+    """Ruta absoluta y sin enlaces de un programa de confianza, o None.
+
+    De confianza quiere decir: en una carpeta del sistema cuyo camino entero
+    es de root y no escribible por grupo ni por otros, y el fichero mismo
+    regular, de root, no escribible por grupo ni por otros, y ejecutable.
+    """
+    for carpeta in _FIABLES:
         try:
-            st = os.stat(p)
-        except OSError:
+            dfd = _abrir_dir_del_sistema(carpeta)
+        except (OSError, Inseguro):
+            continue                      # p.ej. /bin, que aqui es un enlace
+        try:
+            real = _resolver(dfd, carpeta, nombre)
+            fd = os.open(real, _ABRIR, dir_fd=dfd)
+            try:
+                st = os.fstat(fd)
+                if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
+                        and not _escribible_por_otros(st)
+                        and st.st_mode & stat.S_IXUSR):
+                    return os.path.join(carpeta, real)
+            finally:
+                os.close(fd)
+        except (OSError, Inseguro):
             continue
-        if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
-                and not st.st_mode & stat.S_IWOTH
-                and st.st_mode & stat.S_IXUSR):
-            return p
+        finally:
+            os.close(dfd)
     return None

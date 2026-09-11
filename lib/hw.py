@@ -10,6 +10,7 @@ None y la interfaz simplemente no enseña ese control. Nunca un boton que no
 hace nada.
 """
 import os, re, glob, time, subprocess
+import seguro
 
 # ── Utilidades ──────────────────────────────────────────────────────────────
 
@@ -145,10 +146,14 @@ def gpu_estado():
         return ("dormida", None, None, 0)
     t = w = None
     try:
-        r = subprocess.run(["nvidia-smi",
+        smi = seguro.programa("nvidia-smi")
+        if not smi:
+            return ("despierta", None, None, clientes)
+        r = subprocess.run([smi,
                             "--query-gpu=temperature.gpu,power.draw",
                             "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=3)
+                           capture_output=True, text=True, timeout=3,
+                           env=seguro.ENTORNO)
         if r.returncode == 0 and r.stdout.strip():
             p = [x.strip() for x in r.stdout.strip().split(",")]
             t, w = int(float(p[0])), float(p[1])
@@ -468,10 +473,14 @@ def red(_prev={}):
 
 def top_procesos(n=5):
     """Los que mas CPU consumen, para saber quien esta calentando el equipo."""
+    ps = seguro.programa("ps")
+    if not ps:
+        return []
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pcpu=,pmem=,comm=", "--sort=-pcpu"],
-            capture_output=True, text=True, timeout=4).stdout
+            [ps, "-eo", "pcpu=,pmem=,comm=", "--sort=-pcpu"],
+            capture_output=True, text=True, timeout=4,
+            env=seguro.ENTORNO).stdout
     except Exception:
         return []
     r = []
