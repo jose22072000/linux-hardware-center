@@ -10,7 +10,7 @@ Lo de la curva es el motivo de este fichero. Dibujarla y luego pedir los seis
 numeros en una caja de texto era lo peor de los dos mundos: el usuario ve la
 forma pero tiene que traducirla a numeros a mano para cambiarla.
 """
-import math, collections, gi
+import math, collections, cairo, gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gdk, GObject
 
@@ -96,11 +96,11 @@ class Historia(Gtk.DrawingArea):
     """Los ultimos minutos. El eje se ajusta a lo visto, no a un tope
     inventado, para que una subida pequeña tambien se note."""
 
-    def __init__(self, maximo=100, aviso=None):
+    def __init__(self, maximo=100, aviso=None, unidad=""):
         super().__init__()
         self.datos = collections.deque(maxlen=HISTORIA)
-        self.maximo, self.aviso = maximo, aviso
-        self.set_content_height(52)
+        self.maximo, self.aviso, self.unidad = maximo, aviso, unidad
+        self.set_content_height(76)
         self.set_hexpand(True)
         self.set_draw_func(self._pintar)
 
@@ -114,6 +114,11 @@ class Historia(Gtk.DrawingArea):
         r, g, b = _rgb(self)
         if self.aviso and self.datos[-1] >= self.aviso:
             r, g, b = 0.88, 0.27, 0.25
+        # Franja superior reservada para las etiquetas. Sin ella, cuando el
+        # valor esta alto la linea pasa por encima del texto y no se lee ni
+        # una cosa ni la otra.
+        CABECERA = 18
+        util = h - CABECERA
         tope = max(self.maximo * 0.25, max(self.datos) * 1.15)
         # Se reparten por TODO el ancho con los datos que haya.
         # Antes el paso era fijo (ancho / HISTORIA) y la linea se pegaba a la
@@ -121,14 +126,19 @@ class Historia(Gtk.DrawingArea):
         # esquina hasta que el historial se llenaba, un par de minutos despues.
         n = len(self.datos)
         paso = w / (n - 1)
-        pts = [(i * paso, h - (v / tope) * h) for i, v in enumerate(self.datos)]
+        pts = [(i * paso, h - (v / tope) * util) for i, v in enumerate(self.datos)]
 
         cr.move_to(pts[0][0], h)
         for x, y in pts:
             cr.line_to(x, y)
         cr.line_to(pts[-1][0], h)
         cr.close_path()
-        cr.set_source_rgba(r, g, b, 0.15)
+        # Degradado en vez de un bloque plano: el relleno solido pesaba
+        # demasiado para lo poco que aporta, y tapaba la tarjeta.
+        deg = cairo.LinearGradient(0, 0, 0, h)
+        deg.add_color_stop_rgba(0, r, g, b, 0.22)
+        deg.add_color_stop_rgba(1, r, g, b, 0.02)
+        cr.set_source(deg)
         cr.fill()
         cr.move_to(*pts[0])
         for x, y in pts[1:]:
@@ -136,6 +146,24 @@ class Historia(Gtk.DrawingArea):
         cr.set_source_rgba(r, g, b, 0.9)
         cr.set_line_width(1.8)
         cr.stroke()
+
+        # Escala: sin un numero, una linea que sube no dice CUANTO sube.
+        # Se marcan el techo del eje y el minimo y maximo vistos.
+        alto, bajo = max(self.datos), min(self.datos)
+        cr.select_font_face("sans", 0, 0)
+        cr.set_font_size(10)
+        cr.set_source_rgba(r, g, b, 0.45)
+        # Solo max y min, arriba a la derecha. El techo del eje y el cero se
+        # quitaron: caian justo donde pasa la linea y se pisaban con ella.
+        etq = f"max {alto:.0f}{self.unidad}  ·  min {bajo:.0f}{self.unidad}"
+        e = cr.text_extents(etq)
+        cr.move_to(w - e.width - 4, 12)
+        cr.show_text(etq)
+
+        # Punto en el ultimo valor, para no perder de vista donde estas.
+        cr.set_source_rgba(r, g, b, 1)
+        cr.arc(pts[-1][0], pts[-1][1], 2.6, 0, 6.2832)
+        cr.fill()
 
 
 class Curva(Gtk.DrawingArea):

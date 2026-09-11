@@ -186,6 +186,7 @@ class Ventana(Adw.ApplicationWindow):
         super().__init__(application=app, title="Centro",
                          default_width=680, default_height=800)
         self.agujas, self.historias, self.curvas = {}, {}, {}
+        self.marcas_hist = {}
         self.cargando = True
         self.hay_ec = hw.ec_disponible()
         self.bat = hw.bateria()
@@ -220,7 +221,7 @@ class Ventana(Adw.ApplicationWindow):
 
         self.set_size_request(340, 420)      # minimo razonable, no se rompe antes
         bp = Adw.Breakpoint.new(
-            Adw.BreakpointCondition.parse("max-width: 680px"))
+            Adw.BreakpointCondition.parse("max-width: 900px"))
         bp.add_setter(cab, "title-widget", self.titulo)
         bp.add_setter(self.barra_abajo, "reveal", True)
         self.add_breakpoint(bp)
@@ -231,26 +232,25 @@ class Ventana(Adw.ApplicationWindow):
 
     # ─── Panel ───
     def _pagina(self, grupos):
-        """Pagina que aprovecha el ancho en vez de dejarlo vacio.
+        """Una sola columna de secciones a todo el ancho.
 
-        `Adw.PreferencesPage` clava el contenido en una columna de ~600 px y
-        lo centra: en una ventana grande quedaban dos palmos de vacio a cada
-        lado. Aqui los grupos van en un FlowBox, asi que al ensanchar se
-        reparten en dos columnas solos y al estrechar vuelven a una.
+        Se probaron dos columnas y se descartaron: repartir tarjetas sueltas
+        entre dos columnas deja siempre un borde desigual —una columna acaba
+        antes que la otra, y dos tarjetas vecinas de distinta altura no se
+        alinean— y ademas cambia de sitio las cosas segun el ancho, asi que
+        nunca sabes donde esta nada.
+
+        Lo que aprovecha el ancho es el CONTENIDO: los medidores se reparten
+        en fila, los nucleos en rejilla, las graficas se estiran. La seccion
+        siempre ocupa todo y siempre esta en el mismo sitio.
         """
-        # homogeneous=False a proposito: en un FlowBox homogeneo TODOS los
-        # hijos toman el tamaño del mas grande, asi que un grupo corto (los
-        # medidores) se estiraba hasta la altura del mas largo y dejaba medio
-        # panel en blanco. Cada grupo debe medir lo que mide.
-        fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
-                         max_children_per_line=2, min_children_per_line=1,
-                         homogeneous=False, row_spacing=18, column_spacing=18,
-                         valign=Gtk.Align.START)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20,
+                      valign=Gtk.Align.START)
         for g in grupos:
             g.set_valign(Gtk.Align.START)
             g.set_hexpand(True)
-            fb.append(g)
-        cl = Adw.Clamp(maximum_size=1280, tightening_threshold=640, child=fb)
+            col.append(g)
+        cl = Adw.Clamp(maximum_size=1100, tightening_threshold=560, child=col)
         for m in ("top", "bottom", "start", "end"):
             getattr(cl, f"set_margin_{m}")(18)
         return Gtk.ScrolledWindow(child=cl, vexpand=True, hexpand=True)
@@ -263,12 +263,25 @@ class Ventana(Adw.ApplicationWindow):
         # fila siguiente en vez de encogerse hasta no leerse.
         caja = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
                            max_children_per_line=4, min_children_per_line=2,
-                           homogeneous=True, row_spacing=6, column_spacing=6)
-        caja.set_margin_top(6); caja.set_margin_bottom(6)
+                           homogeneous=True, row_spacing=10, column_spacing=10)
+        # Sin esto los medidores se apelotonan a la izquierda y dejan un hueco
+        # a la derecha en cuanto la ventana es ancha.
+        caja.set_halign(Gtk.Align.FILL)
+        caja.set_hexpand(True)
         caja.set_valign(Gtk.Align.START)
         caja.set_vexpand(False)
+        # Un `PreferencesGroup` solo dibuja tarjeta alrededor de una lista de
+        # filas; con un FlowBox dentro, los medidores quedaban flotando sobre
+        # el fondo mientras los grupos de al lado si tenian su recuadro.
+        marco = Gtk.Box()
+        marco.add_css_class("card")
+        marco.append(caja)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(caja, f"set_margin_{m}")(10)
         def aguja(clave, titulo, unidad, maximo, aviso=None, critico=None):
             a = Aguja(titulo, unidad, maximo, aviso, critico)
+            a.set_hexpand(True)
+            a.set_halign(Gtk.Align.FILL)
             self.agujas[clave] = a
             caja.append(a)
         aguja("cpu_t", "Procesador", "°C", 100, 75, 88)
@@ -276,22 +289,38 @@ class Ventana(Adw.ApplicationWindow):
         aguja("fan", "Ventilador", "rpm", 6000)
         if hw.gpu_discreta():
             aguja("gpu", "Gráfica", "°C", 100, 70, 85)
-        g.add(caja)
+        g.add(marco)
         grupos.append(g)
 
         g = Adw.PreferencesGroup(title="Últimos minutos")
-        for clave, t, maximo, aviso in (("cpu_t", "Temperatura", 100, 85),
-                                        ("cpu_u", "Uso del procesador", 100, None),
-                                        ("fan", "Ventilador", 6000, None)):
-            hist = Historia(maximo, aviso)
-            hist.set_margin_start(12); hist.set_margin_end(12)
-            hist.set_margin_top(2); hist.set_margin_bottom(8)
+        for clave, titulo, unidad, maximo, aviso in (
+                ("cpu_t", "Temperatura", "°", 100, 85),
+                ("cpu_u", "Uso del procesador", "%", 100, None),
+                ("fan", "Ventilador", "", 6000, None)):
+            # Nombre, valor de ahora y grafica en la MISMA tarjeta: separar el
+            # titulo del dibujo obligaba a mirar dos sitios para leer un dato.
+            tarjeta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tarjeta.add_css_class("card")
+
+            cab = Gtk.Box(spacing=8)
+            for m in ("top", "start", "end"):
+                getattr(cab, f"set_margin_{m}")(10)
+            et = Gtk.Label(label=titulo, xalign=0, hexpand=True)
+            et.add_css_class("dim-label")
+            val = Gtk.Label(label="—")
+            val.add_css_class("heading")
+            val.add_css_class("numeric")
+            cab.append(et); cab.append(val)
+            tarjeta.append(cab)
+
+            hist = Historia(maximo, aviso, unidad)
+            for m in ("start", "end", "bottom"):
+                getattr(hist, f"set_margin_{m}")(10)
+            tarjeta.append(hist)
+
             self.historias[clave] = hist
-            r = Adw.ActionRow(title=t)
-            g.add(r)
-            f = Adw.ActionRow(activatable=False)
-            f.set_child(hist)
-            g.add(f)
+            self.marcas_hist[clave] = val
+            g.add(tarjeta) if not g.get_first_child() else g.add(tarjeta)
         grupos.append(g)
 
         g = Adw.PreferencesGroup(title="Estado")
@@ -793,16 +822,20 @@ class Ventana(Adw.ApplicationWindow):
                    "manual:on": "forzado a mano", "manual:off": "apagado a mano"}
         self.f_refuerzo.set_subtitle(niveles.get(est.get("refuerzo", ""), "—"))
 
+        def hist(clave, valor, texto):
+            self.historias[clave].empujar(valor)
+            self.marcas_hist[clave].set_label(texto)
+
         t = hw.temp_cpu()
         self.agujas["cpu_t"].poner(t)
-        self.historias["cpu_t"].empujar(t)
+        hist("cpu_t", t, f"{t} °C" if t is not None else "—")
         u = hw.cpu_uso()
         self.agujas["cpu_u"].poner(u)
-        self.historias["cpu_u"].empujar(u)
+        hist("cpu_u", u, f"{u} %" if u is not None else "—")
         vs = [r for _, r in hw.ventiladores() if r]
         rpm = max(vs) if vs else 0
         self.agujas["fan"].poner(rpm, texto_alt=(str(rpm) if rpm else "parado"))
-        self.historias["fan"].empujar(rpm)
+        hist("fan", rpm, f"{rpm} rpm" if rpm else "parado")
         if "gpu" in self.agujas:
             e, gt, gw, _ = hw.gpu_estado()
             if e == "dormida":
@@ -873,7 +906,12 @@ class Ventana(Adw.ApplicationWindow):
             for n, _f, _t in nuc:
                 c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
                 c.add_css_class("card")
-                c.set_margin_top(6); c.set_margin_bottom(6)
+                # Alto fijo: sin esto una tarjeta con temperatura es mas alta
+                # que una sin ella y la rejilla queda dentada.
+                c.set_size_request(-1, 76)
+                c.set_valign(Gtk.Align.START)
+                for m in ("top", "bottom"):
+                    getattr(c, f"set_margin_{m}")(8)
                 t = Gtk.Label(label=f"Hilo {n}")
                 t.add_css_class("dim-label")
                 t.add_css_class("caption")
