@@ -65,7 +65,12 @@ ok(f"pgrep -> {p}") if p and p.startswith("/") else mal("no resuelve pgrep")
 ok("no inventa programas") if seguro.programa("no-existe-esto") is None else mal("invento uno")
 
 py = seguro.programa("python3")
-ok(f"python3 resuelto sin enlaces -> {py}") if py and not os.path.islink(py) else mal("devuelve un enlace")
+ok(f"python3 -> {py}") if py == "/usr/bin/python3" else mal(f"devuelve {py}")
+
+# Los enlaces se validan, pero se llama por el nombre pedido: kmod mira su
+# argv[0] y con /usr/bin/kmod se queda escupiendo la ayuda.
+lsm = seguro.programa("lsmod")
+ok(f"lsmod conserva su nombre -> {lsm}") if lsm and lsm.endswith("/lsmod") else mal(f"devuelve {lsm}")
 
 # Un ejecutable del usuario colado en el camino no puede pasar por bueno
 propio = os.path.join(base, "pgrep")

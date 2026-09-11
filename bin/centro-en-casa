@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Escribe y borra dentro del HOME de un usuario, desde root, sin fiarse.
+
+El instalador corre como root y tiene que dejar ficheros en carpetas del
+usuario. `install -o usuario` no vale para eso: sigue enlaces, asi que basta
+con que alguien haya dejado `~/.local/bin` apuntando a otro sitio para que la
+instalacion —o el cambio de dueño— acabe donde no debe.
+
+Aqui cada componente del destino se abre y se valida por separado, las
+carpetas que faltan se crean del usuario, y el fichero se deja de forma
+atomica con permisos y dueño puestos sobre el descriptor. La ruta se saca
+SIEMPRE del passwd del usuario: nada de `HOME` ni de `XDG_CONFIG_HOME`
+heredados, que los elige quien llama.
+
+  centro-en-casa <usuario> copiar          <origen> <destino-rel> <modo>
+  centro-en-casa <usuario> copiar-si-falta <origen> <destino-rel> <modo>
+  centro-en-casa <usuario> borrar          <destino-rel>
+  centro-en-casa <usuario> hay-carpeta     <destino-rel>
+  centro-en-casa <usuario> ruta            <destino-rel>
+"""
+import os, sys, pwd, stat
+
+_AQUI = os.path.dirname(os.path.realpath(__file__))
+for _d in ("/usr/local/lib/centro", os.path.join(os.path.dirname(_AQUI), "lib")):
+    if os.path.isfile(os.path.join(_d, "seguro.py")):
+        sys.path.insert(0, _d)
+        break
+import seguro
+
+
+def leer_origen(ruta):
+    """El origen tambien se abre sin seguir enlaces: si no, un enlace dentro
+    del repo haria que root copiara a la casa del usuario un fichero que solo
+    root puede leer."""
+    fd = os.open(ruta, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise seguro.Inseguro(f"{ruta} no es un fichero normal")
+        datos = b""
+        while True:
+            trozo = os.read(fd, 1 << 20)
+            if not trozo:
+                return datos
+            datos += trozo
+    finally:
+        os.close(fd)
+
+
+def partir(rel):
+    rel = rel.strip("/")
+    if not rel or ".." in rel.split("/"):
+        raise seguro.Inseguro(f"destino no valido: {rel!r}")
+    carpeta, _, nombre = rel.rpartition("/")
+    return carpeta, nombre
+
+
+def main(argv):
+    if len(argv) < 3:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    usuario, orden, resto = argv[1], argv[2], argv[3:]
+    try:
+        u = pwd.getpwnam(usuario)
+    except KeyError:
+        print(f"no existe el usuario {usuario}", file=sys.stderr)
+        return 1
+
+    try:
+        if orden == "ruta":
+            print(os.path.join(u.pw_dir, resto[0].strip("/")))
+            return 0
+
+        if orden == "hay-carpeta":
+            try:
+                dfd = seguro.abrir_carpeta(os.path.join(u.pw_dir, resto[0].strip("/")),
+                                           u.pw_uid, u.pw_gid)
+            except (OSError, seguro.Inseguro):
+                return 1
+            os.close(dfd)
+            return 0
+
+        if orden in ("copiar", "copiar-si-falta"):
+            origen, rel, modo = resto[0], resto[1], int(resto[2], 8)
+            carpeta, nombre = partir(rel)
+            datos = leer_origen(origen)
+            dfd = seguro.abrir_carpeta(os.path.join(u.pw_dir, carpeta),
+                                       u.pw_uid, u.pw_gid, crear=True)
+            try:
+                if orden == "copiar-si-falta" and seguro.existe_en(dfd, nombre):
+                    return 3          # ya estaba; quien llama decide que decir
+                if not seguro.escribir_en(dfd, nombre, datos, modo,
+                                          u.pw_uid, u.pw_gid):
+                    raise OSError(f"no se pudo escribir {rel}")
+            finally:
+                os.close(dfd)
+            return 0
+
+        if orden == "borrar":
+            carpeta, nombre = partir(resto[0])
+            try:
+                dfd = seguro.abrir_carpeta(os.path.join(u.pw_dir, carpeta),
+                                           u.pw_uid, u.pw_gid)
+            except (OSError, seguro.Inseguro):
+                return 0              # no esta: nada que borrar
+            try:
+                seguro.borrar_en(dfd, nombre)
+            finally:
+                os.close(dfd)
+            return 0
+
+    except (OSError, seguro.Inseguro, IndexError, ValueError) as e:
+        print(f"centro-en-casa: {e}", file=sys.stderr)
+        return 1
+
+    print(f"orden desconocida: {orden}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

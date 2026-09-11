@@ -42,7 +42,20 @@ def _comprobar(st, uid, quiero_dir):
 
 
 def _abrir_hijo(dfd, nombre, uid):
-    fd = os.open(nombre, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
+    try:
+        fd = os.open(nombre, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
+    except OSError as e:
+        # Con O_NOFOLLOW un enlace da ELOOP, y si ademas se pidio O_DIRECTORY,
+        # ENOTDIR. Merece un mensaje que se entienda: es EL ataque.
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            try:
+                if stat.S_ISLNK(os.lstat(nombre, dir_fd=dfd).st_mode):
+                    raise Inseguro(
+                        f"«{nombre}» es un enlace simbolico; no se escribe a "
+                        f"traves de enlaces. Quitalo y vuelve a intentarlo.")
+            except OSError:
+                pass
+        raise
     try:
         _comprobar(os.fstat(fd), uid, quiero_dir=True)
     except Exception:
@@ -107,38 +120,74 @@ class Fichero:
             os.close(fd)
 
     def escribir_texto(self, texto):
-        """Guarda de forma atomica: temporal con nombre imprevisible, creado
-        en exclusiva y sin seguir enlaces, con su dueño puesto por descriptor
-        —antes del renombrado, para que no haya carrera que aprovechar— y
-        encima del destino sin soltar la carpeta."""
-        tmp = f".{self.nombre}.{secrets.token_hex(8)}"
+        return escribir_en(self.dfd, self.nombre, texto.encode(),
+                           0o644, self.uid, self.gid)
+
+
+def escribir_en(dfd, nombre, datos, modo, uid, gid):
+    """Deja `datos` como `nombre` dentro de una carpeta YA validada.
+
+    De forma atomica: temporal con nombre imprevisible, creado en exclusiva y
+    sin seguir enlaces, con permisos y dueño puestos **sobre el descriptor y
+    antes del renombrado** —asi no hay carrera que aprovechar ni hace falta
+    CAP_FOWNER— y encima del destino sin soltar la carpeta.
+    """
+    tmp = f".{nombre}.{secrets.token_hex(8)}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    except OSError:
+        return False
+    try:
+        os.write(fd, datos)
+        os.fchmod(fd, modo)
+        os.fchown(fd, uid, gid)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(tmp, nombre, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+        return True
+    except OSError:
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                         | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.dfd)
+            os.unlink(tmp, dir_fd=dfd)
         except OSError:
-            return False
-        try:
-            os.write(fd, texto.encode())
-            # Los permisos ANTES del dueño: en cuanto el fichero es del
-            # usuario, root ya no puede cambiarle el modo sin CAP_FOWNER, y
-            # el objetivo es que el demonio no necesite esa capacidad.
-            os.fchmod(fd, 0o644)
-            os.fchown(fd, self.uid, self.gid)
-            os.fsync(fd)
+            pass
+        return False
+    finally:
+        if fd is not None:
             os.close(fd)
-            fd = None
-            os.replace(tmp, self.nombre, src_dir_fd=self.dfd, dst_dir_fd=self.dfd)
-            os.fsync(self.dfd)
-            return True
-        except OSError:
+
+
+def existe_en(dfd, nombre):
+    try:
+        os.lstat(nombre, dir_fd=dfd)
+        return True
+    except OSError:
+        return False
+
+
+def borrar_en(dfd, nombre):
+    """Quita `nombre` de una carpeta ya validada. Si es un enlace se borra el
+    enlace, nunca lo que apunte: `unlink` no sigue enlaces."""
+    try:
+        st = os.lstat(nombre, dir_fd=dfd)
+    except OSError:
+        return False
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            hijo = os.open(nombre, _ABRIR | os.O_DIRECTORY, dir_fd=dfd)
             try:
-                os.unlink(tmp, dir_fd=self.dfd)
-            except OSError:
-                pass
-            return False
-        finally:
-            if fd is not None:
-                os.close(fd)
+                for n in os.listdir(hijo):
+                    borrar_en(hijo, n)
+            finally:
+                os.close(hijo)
+            os.rmdir(nombre, dir_fd=dfd)
+        else:
+            os.unlink(nombre, dir_fd=dfd)
+        return True
+    except OSError:
+        return False
 
 
 # ── Programas que lanza root ────────────────────────────────────────────────
@@ -203,11 +252,19 @@ def _resolver(dfd, carpeta, nombre, saltos=0):
 
 
 def programa(nombre):
-    """Ruta absoluta y sin enlaces de un programa de confianza, o None.
+    """Ruta absoluta de un programa de confianza, o None.
 
     De confianza quiere decir: en una carpeta del sistema cuyo camino entero
     es de root y no escribible por grupo ni por otros, y el fichero mismo
-    regular, de root, no escribible por grupo ni por otros, y ejecutable.
+    —siguiendo la cadena de enlaces a mano, uno a uno y exigiendo que cada
+    enlace sea de root— regular, de root, no escribible por grupo ni por
+    otros, y ejecutable.
+
+    Se devuelve **la ruta pedida**, no el final de la cadena. Es a proposito:
+    `lsmod` y `modprobe` son enlaces a `kmod`, que mira su propio `argv[0]`
+    para saber que es. Devolviendo `/usr/bin/kmod` se quedaba escupiendo la
+    ayuda. Lo que importa es haber comprobado a donde lleva el enlace, no
+    llamar por el otro nombre.
     """
     for carpeta in _FIABLES:
         try:
@@ -222,7 +279,7 @@ def programa(nombre):
                 if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
                         and not _escribible_por_otros(st)
                         and st.st_mode & stat.S_IXUSR):
-                    return os.path.join(carpeta, real)
+                    return os.path.join(carpeta, nombre)
             finally:
                 os.close(fd)
         except (OSError, Inseguro):

@@ -74,7 +74,47 @@ el dueño. `CAP_DAC_READ_SEARCH` tampoco: se probo y no aporta nada.
 Escribir en sysfs y en el EC no necesita ninguna: esos ficheros son de root y
 tienen su bit de escritura.
 
+El interprete no se elige por `PATH`: la unidad lo fija
+(`ExecStart=/usr/bin/python3 …`) y el shebang es `#!/usr/bin/python3`. Un
+shebang con `env` es el `PATH` decidiendo quien corre como root.
+
 Nota de `systemd-analyze security`: **9.4 UNSAFE antes, 4.1 OK ahora**.
+
+## El instalador
+
+`instalar.sh` tambien corre como root, y tiene los mismos dos problemas que el
+demonio: de donde salen los programas y donde acaban las escrituras.
+
+**El entorno se tira entero.** El script se vuelve a lanzar con `env -i` y un
+`PATH` fijo. Lo que se hereda no decide nada, y en particular
+`XDG_CONFIG_HOME` **ya ni se mira**: con el puesto, un
+`sudo XDG_CONFIG_HOME=/etc ./instalar.sh` hacia que root creara `/etc/centro` a
+nombre del usuario. La casa sale del `passwd`, por `getent`, y de ningun otro
+sitio.
+
+**Los programas se verifican antes de usarse.** `getent`, `cut`, `install`,
+`lsmod`, `grep`, `modprobe`, `systemctl` y `rm` pasan por `seguro.programa()`;
+si alguno no se puede verificar, el instalador se para y lo dice. El shebang es
+`#!/usr/bin/bash`, no `env bash`.
+
+**Lo que va dentro de tu casa no lo escribe `install`.** `install -o usuario`
+sigue enlaces: basta con que `~/.local/bin` apunte a otro sitio para que la
+copia —o el cambio de dueño— acabe donde el atacante quiera. Esas escrituras
+las hace `bin/centro-en-casa`, que abre cada componente del destino validado y
+por descriptor, crea lo que falte a nombre del usuario y deja el fichero con
+`escribir_en()`. El origen tambien se abre con `O_NOFOLLOW`: si no, un enlace
+dentro del repo haria que root copiara a tu casa un fichero que solo root
+puede leer.
+
+Comprobado con la trampa puesta: con `~/.config/omarchy/plugins/centro.panel`
+convertido en un enlace a una carpeta de `/root`, la instalacion **se niega,
+lo explica y no toca la victima**, y el resto queda instalado igual.
+
+Un detalle que costo un intento: `programa()` devuelve **la ruta pedida**, no
+el final de la cadena de enlaces. `lsmod` y `modprobe` son enlaces a `kmod`,
+que mira su propio `argv[0]`; llamandolo `/usr/bin/kmod` se quedaba escupiendo
+la ayuda. Lo que importa es haber comprobado a donde lleva el enlace, no
+llamar por el otro nombre.
 
 ## Las pruebas
 
