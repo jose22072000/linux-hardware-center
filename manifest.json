@@ -4,7 +4,7 @@
   "name": "Centro",
   "version": "1.0.0",
   "author": "jose22072000",
-  "description": "Temperaturas, ventiladores, perfiles que cambian solos, batería y gráfica híbrida. Detecta el hardware: lo que tu equipo no tenga, no aparece.",
+  "description": "Temperatures, fan curves, power profiles that switch themselves, battery care and hybrid graphics. Detects your hardware: what your machine doesn't have doesn't show up.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Centro",
-    "description": "Estado del equipo de un vistazo y acciones rápidas de perfil y gráfica.",
+    "description": "Machine status at a glance, with quick profile and GPU actions.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",

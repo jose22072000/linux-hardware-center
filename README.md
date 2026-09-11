@@ -1,136 +1,136 @@
 # Centro
 
-Panel de control para portátiles y sobremesas con Linux: temperaturas,
-ventiladores, perfiles que cambian solos, batería y privacidad — en una
-ventana y en un icono de la barra.
+**English** · [Español](README.es.md)
 
-Nació para un MSI GF63, donde MSI Center no existe en Linux, pero **detecta el
-hardware en vez de darlo por supuesto**: en un equipo sin controlador
-embebido, sin batería o sin gráfica dedicada, esos controles simplemente no
-aparecen. Nunca un botón que no hace nada.
+A control panel for Linux laptops and desktops: temperatures, fan curves,
+power profiles that switch themselves, battery care, hybrid graphics and
+privacy toggles — in one window and one bar icon.
 
-> *A control panel for Linux laptops and desktops: temperatures, fan curves,
-> automatic power profiles, battery care and privacy toggles. Spanish UI.*
+It started on an MSI GF63, where MSI Center doesn't exist for Linux. But it
+**detects your hardware instead of assuming it**: on a machine with no embedded
+controller, no battery or no discrete GPU, those controls simply don't appear.
+
+> Note: the user interface is currently in Spanish. Translations are very
+> welcome — every string lives in a single file, `bin/centro`.
 
 ![Panel](docs/img/panel.png)
 
-## Qué hace
+## What it does
 
-**Perfiles que cambian solos.** Detecta si estás jugando, trabajando o con el
-equipo parado y ajusta el tope del procesador, la curva del ventilador y el
-escenario del equipo. Se le dice qué programas cuentan como cada cosa
-eligiéndolos de una lista.
+**Profiles that switch themselves.** It notices whether you're gaming, working
+or idle and adjusts the CPU ceiling, the fan curve and the machine's own
+performance scenario. You pick which programs count as what from a list of
+what's running.
 
-| perfil | cuándo | qué hace |
+| profile | when | what it does |
 |---|---|---|
-| Juego | un juego abierto, o algo usando la gráfica dedicada | tope alto, mucho aire |
-| Trabajo | un editor o IDE abierto | equilibrado |
-| Estable | a mano | sin bandazos: el ventilador casi no cambia de velocidad |
-| Reposo | ni lo uno ni lo otro | tope bajo, el equipo enfría |
-| Fresco | a mano | alivio con calor: baja pantalla y apaga el teclado |
+| Game | a game is open, or something is using the discrete GPU | high ceiling, lots of air |
+| Work | an editor or IDE is open | balanced |
+| Steady | manual | no swings: the fan barely changes speed |
+| Idle | neither | low ceiling, the machine cools down |
+| Cool | manual | heat relief: dims the screen, turns off the keyboard light |
 
-**Curva del ventilador que se arrastra.** Los seis puntos se mueven con el
-ratón. No se puede guardar una curva inválida: cada punto se mueve solo entre
-sus vecinos.
+**A fan curve you drag.** Six points, moved with the mouse. You can't save an
+invalid curve: each point only moves between its neighbours.
 
-![Perfiles](docs/img/perfiles.png)
+![Profiles](docs/img/perfiles.png)
 
-**Enfriado prolongado.** El ventilador sigue soplando después de que baje la
-temperatura, porque el disipador sigue caliente. Se ajusta con un rango
-*desde / hasta* y un tiempo mínimo.
+**Extended cooling.** The fan keeps running after the temperature drops,
+because the heatsink is still hot. Configured as a range — *from* / *until* —
+plus a minimum time.
 
-**Cuidado de la batería.** Límite de carga (cargarla siempre al 100 % la
-desgasta antes) y salud real frente a su capacidad original.
+**Battery care.** Charge limit (always charging to 100% wears it out faster)
+and real health against its original capacity.
 
-**Privacidad.** Apagar la cámara la desconecta de verdad: `/dev/video*`
-desaparece del sistema, y el piloto de la tecla se apaga con ella.
+**Privacy.** Turning the camera off really disconnects it: `/dev/video*`
+disappears from the system, and the key's indicator light goes off with it.
 
-**Luz del teclado automática.** Se enciende al caer la tarde y se apaga por la
-mañana. Va por horario porque la mayoría de los portátiles no traen sensor de
-luz; si el tuyo no tiene teclado retroiluminado, el control no aparece.
+**Automatic keyboard backlight.** On at dusk, off in the morning. Time-based,
+because most laptops have no ambient light sensor; if yours has no backlit
+keyboard, the control doesn't appear.
 
-**Todos los sensores.** Frecuencia y temperatura de cada hilo, discos con su
-temperatura, memoria, red y qué está consumiendo ahora mismo.
+**Every sensor.** Frequency and temperature per thread, disks with their
+temperature, memory, network, and what's using the machine right now.
 
-![Sensores](docs/img/sensores.png)
+![Sensors](docs/img/sensores.png)
 
-**Herramientas.** Prueba de esfuerzo que dice si el procesador se frena por
-calor, prueba de ventiladores, informe del equipo al portapapeles, registro.
+**Tools.** A stress test that tells you whether the CPU had to throttle from
+heat, a fan test, a machine report copied to the clipboard, and the log.
 
-![Herramientas](docs/img/util.png)
+![Tools](docs/img/util.png)
 
-**Widget de barra** para [Omarchy](https://omarchy.org/): la temperatura de la
-pieza más caliente siempre a la vista, y al desplegarlo todo el detalle más los
-botones de perfil y de gráfica.
+**Bar widget** for [Omarchy](https://omarchy.org/): the hottest component's
+temperature always visible, and the full detail plus profile and GPU buttons
+when you open it.
 
-Es **el mismo proyecto**, no dos: la ventana y el widget escriben la misma
-configuración y el demonio la aplica, así que cambies donde cambies, lo otro se
-entera.
+It's **one project, not two**: the window and the widget write the same
+configuration and the daemon applies it, so whichever you change, the other
+one knows.
 
-![Widget de barra](docs/img/barra.png)
+![Bar widget](docs/img/barra.png)
 
-## Primero mira qué tienes, después decide qué enseñar
+## It looks at what you have, then decides what to show
 
-Nada está dado por hecho. Antes de dibujar un solo control, `hw.py` busca:
+Nothing is assumed. Before drawing a single control, `hw.py` looks for:
 
-| | cómo se busca |
+| | how it's found |
 |---|---|
-| Controlador del equipo | por driver (`msi-ec`, `asus-nb-wmi`, `thinkpad_acpi`, `hp-wmi`, `ideapad_laptop`) |
-| Curva del ventilador | solo si se conoce el mapa de registros de ese controlador |
-| Tope del procesador | `intel_pstate` o `amd_pstate` si están; si no, por frecuencia |
-| Sensores | por familia (`coretemp`, `k10temp`, `iwlwifi`, `ath*`, `nvme`, `amdgpu`…), y lo que no esté en la tabla sale con su propio nombre |
-| Gráficas | por clase PCI y fabricante, no por una ruta fija |
-| Batería, retroiluminado, luz del teclado | buscados, no supuestos |
+| Embedded controller | by driver (`msi-ec`, `asus-nb-wmi`, `thinkpad_acpi`, `hp-wmi`, `ideapad_laptop`) |
+| Fan curve | only if that controller's register map is known |
+| CPU ceiling | `intel_pstate` or `amd_pstate` if present, otherwise by frequency |
+| Sensors | by family (`coretemp`, `k10temp`, `iwlwifi`, `ath*`, `nvme`, `amdgpu`…), and anything not in the table shows under its own name |
+| Graphics | by PCI class and vendor, not a fixed path |
+| Battery, backlight, keyboard light | looked for, not assumed |
 
-**Lo que tu equipo no tenga, no aparece.** Ni un botón que no haga nada, ni una
-cifra a `—` fija. Y si el controlador embebido no es de los que tienen mapa de
-curva conocido, se usa todo lo demás pero la curva no se ofrece: escribir a
-ciegas en el controlador de un portátil ajeno es la forma rápida de romperlo.
+**What your machine doesn't have doesn't show up.** No dead buttons, no fields
+stuck at `—`. And if the embedded controller isn't one with a known register
+map, everything else still works but the fan curve isn't offered: writing
+blindly into someone else's laptop controller is the quick way to break it.
 
-**Las teclas Fn mandan.** Si apagas la cámara con Fn+F6 o subes la luz del
-teclado con su tecla, el programa lo adopta en vez de deshacerlo. Una tecla del
-teclado es el usuario hablando.
+**The Fn keys win.** If you turn the camera off with Fn+F6, or raise the
+keyboard light with its key, the program adopts that instead of undoing it. A
+key press is the user talking.
 
-## Cómo está hecho
+## How it's built
 
 ```
-centrod   demonio. LO ÚNICO que corre como root.
-centro    la ventana (GTK4 + libadwaita)
-fresco    atajo de terminal
-hw.py     capa de hardware: todo se detecta, nada se cablea
+centrod   the daemon. The ONLY thing running as root.
+centro    the window (GTK4 + libadwaita)
+fresco    terminal shortcut
+hw.py     hardware layer: everything is detected, nothing is hardcoded
 ```
 
-**Ni la ventana ni el widget piden contraseña.** Solo escriben
-`~/.config/centro/centro.conf`, un fichero de texto tuyo. El demonio lo lee y
-aplica. Toda la escritura privilegiada vive en un sitio.
+**Neither the window nor the widget ever asks for a password.** They only write
+`~/.config/centro/centro.conf`, a plain text file that belongs to you. The
+daemon reads it and applies it. All privileged writing lives in one place.
 
-**No se sondea la gráfica dedicada si está dormida.** El estado sale de
-`sysfs`; a `nvidia-smi` solo se le pregunta si ya está despierta. Sondearla en
-bucle la mantendría en vela y tiraría abajo su ahorro de energía.
+**The discrete GPU is never polled while it sleeps.** Its state comes from
+`sysfs`; `nvidia-smi` is only asked if it's already awake. Polling it in a loop
+would keep it awake and undo its own power saving.
 
-## Instalar
+## Install
 
-Hace falta `python3`, `python-gobject` y `libadwaita`.
+Needs `python3`, `python-gobject` and `libadwaita`.
 
-### En Omarchy
+### On Omarchy
 
 ```bash
 omarchy plugin add https://github.com/jose22072000/linux-hardware-center.git --enable
 ```
 
-Eso pone el widget en la barra. Para que además funcionen los perfiles y la
-curva del ventilador hace falta el servicio, que necesita permisos:
+That puts the widget in the bar. For the profiles and the fan curve to
+actually work you also need the service, which requires permissions:
 
 ```bash
 sudo ~/.config/omarchy/plugins/centro.panel/instalar.sh
 ```
 
-Son dos pasos a propósito: el widget solo lee, pero cambiar la curva del
-ventilador o el tope del procesador se escribe en el controlador del equipo y
-eso pide root. Si te quedas en el primer paso, el widget te lo dice en vez de
-enseñarte botones que no harían nada.
+Two steps on purpose: the widget only reads, but changing the fan curve or the
+CPU ceiling writes into the machine's controller and that needs root. If you
+stop after the first step, the widget says so instead of showing you buttons
+that would do nothing.
 
-### En cualquier otro escritorio
+### On any other desktop
 
 ```bash
 git clone https://github.com/jose22072000/linux-hardware-center.git
@@ -138,67 +138,66 @@ cd linux-hardware-center
 sudo ./instalar.sh
 ```
 
-Tendrás la ventana y el servicio; el widget de barra es solo para Omarchy y se
-salta solo.
+You get the window and the service; the bar widget is Omarchy-only and is
+skipped automatically.
 
-Para quitarlo todo: `sudo ./instalar.sh desinstalar`. Tu configuración se
-queda por si vuelves.
+To remove everything: `sudo ./instalar.sh desinstalar`. Your configuration
+stays, in case you come back.
 
-## Qué funciona en cada equipo
+## What works on which machine
 
-| | hace falta |
+| | needs |
 |---|---|
-| Temperaturas, uso, discos, red, perfiles | nada: funciona en cualquier Linux |
-| Tope del procesador | `intel_pstate` |
-| Curva del ventilador, escenario, cámara, tecla Fn | controlador embebido compatible (`msi-ec`) |
-| Límite de carga | que la batería exponga `charge_control_end_threshold` |
-| Modo de gráfica | equipo híbrido con gráfica dedicada |
-| Widget de barra | Omarchy |
+| Temperatures, usage, disks, network, profiles | nothing: works on any Linux |
+| CPU ceiling | `intel_pstate`, `amd_pstate`, or plain `cpufreq` |
+| Fan curve, scenario, camera, Fn key | a supported embedded controller |
+| Charge limit | a battery exposing `charge_control_end_threshold` |
+| GPU mode | a hybrid machine with a discrete GPU |
+| Bar widget | Omarchy |
 
-En un sobremesa se ve todo lo de arriba salvo batería y controlador embebido.
-**El control de ventiladores por `pwm` de `hwmon`, que es lo que usan los
-sobremesas, todavía no está**: se ven las temperaturas pero no se gobiernan
-los ventiladores.
+On a desktop you get everything above except battery and embedded controller.
+**Fan control through `hwmon`'s `pwm`, which is what desktops use, isn't there
+yet**: you'll see temperatures but won't be able to drive the fans.
 
-## Licencia
+## Dependencies and permissions
 
-MIT. Incluye `gpu-mode`, de Dima Panov, también MIT — ver
-[TERCEROS.md](TERCEROS.md).
+**Dependencies:** `python3`, `python-gobject` and `libadwaita` for the window.
+The bar widget needs nothing beyond what Omarchy already ships.
 
-## Dependencias y permisos
+**Permissions:** the widget and the window **never ask for a password** — they
+only read sensors and write a text file of yours in `~/.config/centro/`.
 
-**Dependencias:** `python3`, `python-gobject` y `libadwaita` para la ventana.
-El widget de barra no necesita nada más de lo que ya trae Omarchy.
+The `centrod` service does run as root, because changing the fan curve, the CPU
+ceiling or the charge limit writes into the machine's controller. It's installed
+separately and deliberately, with `instalar.sh`. All privileged writing lives
+there and nowhere else.
 
-**Permisos:** el widget y la ventana **no piden contraseña nunca**: solo leen
-sensores y escriben un fichero de texto tuyo en `~/.config/centro/`.
+**Your configuration is never overwritten.** If `~/.config/centro/centro.conf`
+already exists, the installer leaves it alone and tells you. Uninstalling
+leaves it in place.
 
-El servicio `centrod` sí corre como root, porque cambiar la curva del
-ventilador, el tope del procesador o el límite de carga se escribe en el
-controlador del equipo. Se instala aparte y a propósito, con `instalar.sh`.
-Toda la escritura privilegiada vive ahí y en ningún otro sitio.
+**What the installer touches:** `/usr/local/lib/centro/`,
+`/usr/local/bin/centrod`, `/etc/systemd/system/centrod.service`,
+`/etc/modules-load.d/drivetemp.conf` (so SATA disks report their temperature),
+and in your home `~/.local/bin/`, `~/.local/share/applications/` and
+`~/.config/centro/`. `sudo ./instalar.sh desinstalar` removes all of it.
 
-**Tu configuración no se sobrescribe.** Si ya existe `~/.config/centro/centro.conf`,
-el instalador la respeta y te lo dice. Al desinstalar se queda donde está.
+## Help and bugs
 
-**Qué toca el instalador:** `/usr/local/lib/centro/`, `/usr/local/bin/centrod`,
-`/etc/systemd/system/centrod.service`, `/etc/modules-load.d/drivetemp.conf`
-(para que los discos SATA publiquen su temperatura), y en tu carpeta personal
-`~/.local/bin/`, `~/.local/share/applications/` y `~/.config/centro/`.
-`sudo ./instalar.sh desinstalar` lo quita todo.
+If something doesn't work on your machine, **open an issue** with the output of
+*Tools → Copy machine report*: it carries the CPU model, which sensors were
+detected and what controls your machine has. That's enough to add support for
+hardware I don't have in front of me.
 
-## Ayuda y fallos
+What helps most right now:
 
-Si algo no funciona en tu equipo, **abre un issue** con la salida de
-*Herramientas → Copiar informe del equipo*: ahí va el modelo de procesador, los
-sensores que detecta y qué controles tiene tu máquina. Con eso se puede añadir
-soporte para hardware que no tengo delante.
+- trying it on laptops from other brands (Lenovo, ASUS, HP…) and saying what
+  gets detected and what doesn't
+- trying it on a desktop: it should show sensors and profiles, but it doesn't
+  drive fans through `pwm` yet
+- translations: the interface is in Spanish and every string sits in one place,
+  `bin/centro`
 
-Lo que más ayuda ahora mismo:
+## License
 
-- probarlo en portátiles de otras marcas (Lenovo, ASUS, HP…) y decir qué
-  detecta y qué no
-- probarlo en un sobremesa: debería enseñar sensores y perfiles, pero todavía
-  no gobierna ventiladores por `pwm`
-- traducciones: la interfaz está en español y todos los textos están en un
-  solo sitio en `bin/centro`
+MIT. Includes `gpu-mode` by Dima Panov, also MIT — see [TERCEROS.md](TERCEROS.md).

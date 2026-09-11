@@ -105,9 +105,10 @@ instalar() {
   systemctl enable --now centrod
 
   echo
-  verde "Instalado."
+  verde "Instalado. / Installed."
   echo "  Abre «Centro» desde el lanzador, o escribe: centro"
-  echo "  Estado del servicio:  systemctl status centrod"
+  echo "  Open \"Centro\" from your launcher, or run: centro"
+  echo "  Estado del servicio / service status:  systemctl status centrod"
 }
 
 desinstalar() {
