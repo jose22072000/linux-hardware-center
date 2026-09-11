@@ -165,6 +165,28 @@ los ventiladores.
 MIT. Incluye `gpu-mode`, de Dima Panov, también MIT — ver
 [TERCEROS.md](TERCEROS.md).
 
+## Dependencias y permisos
+
+**Dependencias:** `python3`, `python-gobject` y `libadwaita` para la ventana.
+El widget de barra no necesita nada más de lo que ya trae Omarchy.
+
+**Permisos:** el widget y la ventana **no piden contraseña nunca**: solo leen
+sensores y escriben un fichero de texto tuyo en `~/.config/centro/`.
+
+El servicio `centrod` sí corre como root, porque cambiar la curva del
+ventilador, el tope del procesador o el límite de carga se escribe en el
+controlador del equipo. Se instala aparte y a propósito, con `instalar.sh`.
+Toda la escritura privilegiada vive ahí y en ningún otro sitio.
+
+**Tu configuración no se sobrescribe.** Si ya existe `~/.config/centro/centro.conf`,
+el instalador la respeta y te lo dice. Al desinstalar se queda donde está.
+
+**Qué toca el instalador:** `/usr/local/lib/centro/`, `/usr/local/bin/centrod`,
+`/etc/systemd/system/centrod.service`, `/etc/modules-load.d/drivetemp.conf`
+(para que los discos SATA publiquen su temperatura), y en tu carpeta personal
+`~/.local/bin/`, `~/.local/share/applications/` y `~/.config/centro/`.
+`sudo ./instalar.sh desinstalar` lo quita todo.
+
 ## Ayuda y fallos
 
 Si algo no funciona en tu equipo, **abre un issue** con la salida de
