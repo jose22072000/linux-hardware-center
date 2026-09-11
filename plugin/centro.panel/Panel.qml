@@ -212,8 +212,9 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: root.healthText.toUpperCase() + " · " + root.perfil.toUpperCase()
-                    + (root.perfilForzado ? " (FIJO)" : "") + " · TECHO " + root.num("techo") + "%"
+              text: root.perfil.toUpperCase() + (root.perfilForzado ? " (FIJO)" : "")
+                    + " · TECHO " + root.num("techo") + "%"
+                    + (root.tempMaxQue !== "" ? " · " + root.tempMaxQue.toUpperCase() : "")
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -275,96 +276,26 @@ Panel {
 
         PanelSeparator { foreground: root.bar.foreground }
 
-        // ---------- Detalles ----------
-        Column {
+        // ---------- Una linea de contexto ----------
+        // El widget es para el vistazo rapido: lo que se mira de reojo mil
+        // veces al dia. El detalle (carga, swap, encendido, cada sensor,
+        // quien consume) vive en la ventana, que es donde se va a mirar
+        // cuando de verdad quieres mirar. Si todo cabe aqui, el panel crece
+        // hasta salirse de la pantalla — que es justo lo que pasaba.
+        Row {
           width: parent.width
-          spacing: Style.space(10)
+          spacing: Style.space(16)
 
-          PanelSectionHeader {
-            text: "DETALLES"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
+          InfoPair {
+            width: (parent.width - parent.spacing) / 2
+            label: "Ventilador"
+            value: root.num("fan_rpm") > 0 ? root.num("fan_rpm") + " rpm" : "Parado"
           }
-
-          Row {
-            width: parent.width
-            spacing: Style.space(20)
-
-            Column {
-              width: (parent.width - parent.spacing) / 2
-              spacing: Style.spacing.labelGap
-              InfoPair {
-                label: "Ventilador"
-                value: root.num("fan_rpm") > 0 ? root.num("fan_rpm") + " rpm" : "Parado"
-              }
-              InfoPair { label: "Carga (1m)"; value: root.str("load1") }
-              // Se repite la temperatura a proposito: es la misma para la CPU y
-              // para la GPU Intel, y verlo escrito evita buscar una segunda cifra
-              // que este chip nunca va a dar.
-              InfoPair {
-                label: "Pastilla"
-                value: root.dieTemp > 0 ? root.dieTemp + "°C · CPU + GPU" : "—"
-              }
-              InfoPair {
-                label: "Techo GPU"
-                value: root.num("igpu_freq_max") > 0 ? root.num("igpu_freq_max") + " MHz" : "—"
-              }
-            }
-
-            Column {
-              width: (parent.width - parent.spacing) / 2
-              spacing: Style.spacing.labelGap
-              InfoPair {
-                label: "Bateria"
-                value: root.str("bat_pct") + "%"
-                       + (root.num("bat_watts") > 0 ? " · " + root.str("bat_watts") + " W" : "")
-              }
-              InfoPair {
-                label: "Swap"
-                value: root.num("swap_total") > 0
-                       ? root.str("swap_used") + " / " + root.str("swap_total") + " GB"
-                       : "Sin swap"
-              }
-              InfoPair {
-                label: "Encendido"
-                value: {
-                  var s = root.num("uptime")
-                  if (s <= 0) return "—"
-                  var h = Math.floor(s / 3600)
-                  var m = Math.floor((s % 3600) / 60)
-                  return h > 0 ? h + "h " + m + "m" : m + "m"
-                }
-              }
-            }
-          }
-        }
-
-        PanelSeparator { foreground: root.bar.foreground }
-
-        // ---------- Temperatura de cada pieza ----------
-        Column {
-          width: parent.width
-          spacing: Style.space(10)
-
-          PanelSectionHeader {
-            text: "CALOR DEL EQUIPO"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          Repeater {
-            model: ["Procesador", "Grafica", "Chipset", "Disco", "Placa"]
-            InfoPair {
-              required property var modelData
-              visible: modelData === "Grafica"
-                       ? (!root.nvDormida && root.num("nv_temp") > 0)
-                       : root.num("t_" + modelData) > 0
-              label: modelData === "Placa" ? "Placa base" : modelData
-              value: (modelData === "Grafica"
-                        ? root.num("nv_temp")
-                        : root.num("t_" + modelData)) + " °C"
-                     + ((modelData === root.tempMaxQue) ? "   ← lo mas caliente" : "")
-            }
+          InfoPair {
+            width: (parent.width - parent.spacing) / 2
+            label: "Bateria"
+            value: root.str("bat_pct") + "%"
+                   + (root.num("bat_watts") > 0 ? " · " + root.str("bat_watts") + " W" : "")
           }
         }
 
@@ -488,53 +419,6 @@ Panel {
         }
 
         PanelSeparator { foreground: root.bar.foreground }
-
-        // ---------- Quien consume ----------
-        Column {
-          width: parent.width
-          spacing: Style.space(10)
-
-          PanelSectionHeader {
-            text: "QUIEN MAS CONSUME"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          Row {
-            width: parent.width
-            spacing: Style.space(20)
-
-            Column {
-              width: (parent.width - parent.spacing) / 2
-              spacing: Style.spacing.labelGap
-              InfoLabel { text: "CPU"; opacity: 0.45 }
-              Repeater {
-                model: ["top_cpu_1", "top_cpu_2", "top_cpu_3"]
-                InfoValue {
-                  required property var modelData
-                  text: root.str(modelData, "—")
-                  elide: Text.ElideRight
-                  width: parent.width
-                }
-              }
-            }
-
-            Column {
-              width: (parent.width - parent.spacing) / 2
-              spacing: Style.spacing.labelGap
-              InfoLabel { text: "Memoria"; opacity: 0.45 }
-              Repeater {
-                model: ["top_mem_1", "top_mem_2", "top_mem_3"]
-                InfoValue {
-                  required property var modelData
-                  text: root.str(modelData, "—")
-                  elide: Text.ElideRight
-                  width: parent.width
-                }
-              }
-            }
-          }
-        }
 
         // ---------- Accion ----------
         Row {
