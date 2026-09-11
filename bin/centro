@@ -48,6 +48,22 @@ DESC = {
 }
 
 
+def icono(nombre, respaldo="dialog-information-symbolic"):
+    """Devuelve un icono que EXISTA.
+
+    Un nombre que no esta en el tema no da error: GTK pinta el icono de
+    "falta", un cuadro rojo que parece un fallo de la aplicacion. Paso con
+    `temperature-symbolic`, que no existe en Adwaita.
+    """
+    from gi.repository import Gdk
+    d = Gdk.Display.get_default()
+    if d is not None:
+        t = Gtk.IconTheme.get_for_display(d)
+        if not t.has_icon(nombre):
+            nombre = respaldo
+    return Gtk.Image.new_from_icon_name(nombre)
+
+
 def leer_conf():
     cfg = {}
     try:
@@ -158,7 +174,7 @@ class Etiquetas(Gtk.Box):
             if p in self.valores:
                 continue
             r = Adw.ActionRow(title=p, activatable=True)
-            r.add_suffix(Gtk.Image.new_from_icon_name("list-add-symbolic"))
+            r.add_suffix(icono("list-add-symbolic"))
             r.connect("activated", self._elegido, p, d)
             lista.append(r)
             filas.append((p, r))
@@ -197,7 +213,7 @@ class Ventana(Adw.ApplicationWindow):
         stack.add_titled_with_icon(self._perfiles(), "perfiles", "Perfiles",
                                    "preferences-system-symbolic")
         stack.add_titled_with_icon(self._sensores(), "sensores", "Sensores",
-                                   "temperature-symbolic")
+                                   "utilities-system-monitor-symbolic")
         stack.add_titled_with_icon(self._equipo(), "equipo", "Equipo",
                                    "computer-symbolic")
         stack.add_titled_with_icon(self._herramientas(), "util", "Herramientas",
@@ -225,6 +241,11 @@ class Ventana(Adw.ApplicationWindow):
         bp.add_setter(cab, "title-widget", self.titulo)
         bp.add_setter(self.barra_abajo, "reveal", True)
         self.add_breakpoint(bp)
+
+        # Permite abrir directo en una pestaña: `centro --pestana sensores`.
+        inicio = os.environ.get("CENTRO_PESTANA")
+        if inicio and stack.get_child_by_name(inicio):
+            stack.set_visible_child_name(inicio)
 
         self.cargando = False
         self.refrescar()
@@ -262,7 +283,7 @@ class Ventana(Adw.ApplicationWindow):
         # FlowBox y no Box: en una ventana estrecha los medidores bajan a la
         # fila siguiente en vez de encogerse hasta no leerse.
         caja = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
-                           max_children_per_line=4, min_children_per_line=2,
+                           min_children_per_line=2,
                            homogeneous=True, row_spacing=10, column_spacing=10)
         # Sin esto los medidores se apelotonan a la izquierda y dejan un hueco
         # a la derecha en cuanto la ventana es ancha.
@@ -284,55 +305,77 @@ class Ventana(Adw.ApplicationWindow):
             a.set_halign(Gtk.Align.FILL)
             self.agujas[clave] = a
             caja.append(a)
+        # Cada medidor solo si este equipo tiene esa pieza: en un sobremesa
+        # sin grafica dedicada, o en un portatil sin integrada, ese hueco no
+        # debe aparecer. Un medidor a "—" fijo solo confunde.
         aguja("cpu_t", "Procesador", "°C", 100, 75, 88)
         aguja("cpu_u", "Uso", "%", 100, 85, 96)
-        aguja("fan", "Ventilador", "rpm", 6000)
+        if hw.gpu_integrada():
+            aguja("igpu", "Gráfica Intel", "%", 100)
         if hw.gpu_discreta():
-            aguja("gpu", "Gráfica", "°C", 100, 70, 85)
+            aguja("gpu", hw.gpu_nombre() or "Dedicada", "°C", 100, 70, 85)
+        if hw.ventiladores():
+            aguja("fan", "Ventilador", "rpm", 6000)
+        # El tope por fila se pone al numero REAL de medidores, no a un 4
+        # fijo: con cinco piezas quedaba una fila de cuatro y otra de uno,
+        # con un bloque vacio al lado. Asi llenan la linea si hay sitio y se
+        # parten solos cuando no lo hay.
+        caja.set_max_children_per_line(max(2, len(self.agujas)))
         g.add(marco)
         grupos.append(g)
 
         g = Adw.PreferencesGroup(title="Últimos minutos")
-        for clave, titulo, unidad, maximo, aviso in (
-                ("cpu_t", "Temperatura", "°", 100, 85),
-                ("cpu_u", "Uso del procesador", "%", 100, None),
-                ("fan", "Ventilador", "", 6000, None)):
-            # Nombre, valor de ahora y grafica en la MISMA tarjeta: separar el
-            # titulo del dibujo obligaba a mirar dos sitios para leer un dato.
-            tarjeta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            tarjeta.add_css_class("card")
+        # UNA tarjeta con separadores dentro, no tres tarjetas pegadas.
+        # Apiladas, cada una traia sus cuatro esquinas redondeadas y donde se
+        # tocaban quedaba una costura doble muy fea. Es el mismo patron que
+        # usan las listas de ajustes de al lado.
+        pila = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        pila.add_css_class("card")
+        primero = True
+        metricas = [("cpu_t", "Temperatura", "°", 100, 85),
+                    ("cpu_u", "Uso del procesador", "%", 100, None)]
+        if hw.gpu_integrada():
+            metricas.append(("igpu", "Gráfica integrada", "%", 100, None))
+        if hw.ventiladores():
+            metricas.append(("fan", "Ventilador", "", 6000, None))
+        for clave, titulo, unidad, maximo, aviso in metricas:
+            if not primero:
+                pila.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+            primero = False
 
+            bloque = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             cab = Gtk.Box(spacing=8)
             for m in ("top", "start", "end"):
-                getattr(cab, f"set_margin_{m}")(10)
+                getattr(cab, f"set_margin_{m}")(12)
             et = Gtk.Label(label=titulo, xalign=0, hexpand=True)
             et.add_css_class("dim-label")
             val = Gtk.Label(label="—")
             val.add_css_class("heading")
             val.add_css_class("numeric")
             cab.append(et); cab.append(val)
-            tarjeta.append(cab)
+            bloque.append(cab)
 
             hist = Historia(maximo, aviso, unidad)
             for m in ("start", "end", "bottom"):
-                getattr(hist, f"set_margin_{m}")(10)
-            tarjeta.append(hist)
+                getattr(hist, f"set_margin_{m}")(12)
+            bloque.append(hist)
 
             self.historias[clave] = hist
             self.marcas_hist[clave] = val
-            g.add(tarjeta) if not g.get_first_child() else g.add(tarjeta)
+            pila.append(bloque)
+        g.add(pila)
         grupos.append(g)
 
         g = Adw.PreferencesGroup(title="Estado")
         self.f_perfil = Adw.ActionRow(title="Perfil activo", subtitle="—")
-        self.i_perfil = Gtk.Image.new_from_icon_name("emblem-system-symbolic")
+        self.i_perfil = icono("emblem-system-symbolic")
         self.f_perfil.add_prefix(self.i_perfil)
         g.add(self.f_perfil)
         self.f_refuerzo = Adw.ActionRow(title="Refuerzo del ventilador", subtitle="—")
-        self.f_refuerzo.add_prefix(Gtk.Image.new_from_icon_name("weather-windy-symbolic"))
+        self.f_refuerzo.add_prefix(icono("weather-windy-symbolic"))
         g.add(self.f_refuerzo)
         self.f_otros = Adw.ActionRow(title="Otros sensores", subtitle="—")
-        self.f_otros.add_prefix(Gtk.Image.new_from_icon_name("temperature-symbolic"))
+        self.f_otros.add_prefix(icono("utilities-system-monitor-symbolic"))
         g.add(self.f_otros)
         grupos.append(g)
         return self._pagina(grupos)
@@ -452,10 +495,10 @@ class Ventana(Adw.ApplicationWindow):
 
         g = Adw.PreferencesGroup(title="Memoria y red")
         self.f_mem = Adw.ActionRow(title="Memoria", subtitle="—")
-        self.f_mem.add_prefix(Gtk.Image.new_from_icon_name("drive-harddisk-solidstate-symbolic"))
+        self.f_mem.add_prefix(icono("drive-harddisk-solidstate-symbolic"))
         g.add(self.f_mem)
         self.f_red = Adw.ActionRow(title="Red", subtitle="—")
-        self.f_red.add_prefix(Gtk.Image.new_from_icon_name("network-wired-symbolic"))
+        self.f_red.add_prefix(icono("network-wired-symbolic"))
         g.add(self.f_red)
         grupos.append(g)
 
@@ -480,6 +523,8 @@ class Ventana(Adw.ApplicationWindow):
                             "menos la vista. No afecta al calor.")
             self.sw_noche = Adw.SwitchRow(title="Luz nocturna",
                                           subtitle="tonos cálidos")
+            self.sw_noche.add_prefix(
+                icono("night-light-symbolic"))
             self.sw_noche.connect("notify::active", self._set_noche)
             g.add(self.sw_noche)
             grupos.append(g)
@@ -648,7 +693,7 @@ class Ventana(Adw.ApplicationWindow):
                 description="Cargarla siempre al 100 % la desgasta antes. Si el "
                             "equipo vive enchufado, 80 % alarga bastante su vida.")
             self.f_bat = Adw.ActionRow(title="Estado", subtitle="—")
-            self.f_bat.add_prefix(Gtk.Image.new_from_icon_name("battery-symbolic"))
+            self.f_bat.add_prefix(icono("battery-symbolic"))
             g.add(self.f_bat)
             s = Adw.SpinRow.new_with_range(50, 100, 5)
             s.set_title("Cargar como máximo hasta")
@@ -834,8 +879,19 @@ class Ventana(Adw.ApplicationWindow):
         hist("cpu_u", u, f"{u} %" if u is not None else "—")
         vs = [r for _, r in hw.ventiladores() if r]
         rpm = max(vs) if vs else 0
-        self.agujas["fan"].poner(rpm, texto_alt=(str(rpm) if rpm else "parado"))
-        hist("fan", rpm, f"{rpm} rpm" if rpm else "parado")
+        if "fan" in self.agujas:
+            self.agujas["fan"].poner(rpm, texto_alt=(str(rpm) if rpm else "parado"))
+        if "fan" in self.historias:
+            hist("fan", rpm, f"{rpm} rpm" if rpm else "parado")
+        if "igpu" in self.agujas or "igpu" in self.historias:
+            iu, ifr, imx = hw.igpu_estado()
+            if "igpu" in self.agujas:
+                self.agujas["igpu"].poner(
+                    iu, texto_alt=None if iu is not None else "—")
+            if "igpu" in self.historias:
+                hist("igpu", iu,
+                     f"{iu} % · {ifr} MHz" if iu is not None else f"{ifr} MHz")
+
         if "gpu" in self.agujas:
             e, gt, gw, _ = hw.gpu_estado()
             if e == "dormida":
@@ -931,7 +987,7 @@ class Ventana(Adw.ApplicationWindow):
         for ruta, usado, total, pct, temp in hw.discos():
             if ruta not in self.filas_disco:
                 r = Adw.ActionRow(title=ruta)
-                r.add_prefix(Gtk.Image.new_from_icon_name("drive-harddisk-symbolic"))
+                r.add_prefix(icono("drive-harddisk-symbolic"))
                 b = Gtk.LevelBar()
                 b.set_size_request(120, -1)
                 b.set_valign(Gtk.Align.CENTER)
@@ -982,5 +1038,20 @@ class App(Adw.Application):
         (self.props.active_window or Ventana(self)).present()
 
 
+def _argumentos():
+    """`--pestana <nombre>` abre directo en esa pestaña. Se pasa por entorno
+    para no pelearse con el manejo de argumentos de GtkApplication."""
+    args = sys.argv[:]
+    if "--pestana" in args:
+        i = args.index("--pestana")
+        if i + 1 < len(args):
+            os.environ["CENTRO_PESTANA"] = args[i + 1]
+            del args[i:i + 2]
+    if "--ayuda" in args or "--help" in args:
+        print("uso: centro [--pestana panel|perfiles|sensores|equipo|util]")
+        sys.exit(0)
+    return args
+
+
 if __name__ == "__main__":
-    sys.exit(App().run(sys.argv))
+    sys.exit(App().run(_argumentos()))

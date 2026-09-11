@@ -12,6 +12,8 @@ aparecen. Nunca un botón que no hace nada.
 > *A control panel for Linux laptops and desktops: temperatures, fan curves,
 > automatic power profiles, battery care and privacy toggles. Spanish UI.*
 
+![Panel](docs/img/panel.png)
+
 ## Qué hace
 
 **Perfiles que cambian solos.** Detecta si estás jugando, trabajando o con el
@@ -31,6 +33,8 @@ eligiéndolos de una lista.
 ratón. No se puede guardar una curva inválida: cada punto se mueve solo entre
 sus vecinos.
 
+![Perfiles](docs/img/perfiles.png)
+
 **Enfriado prolongado.** El ventilador sigue soplando después de que baje la
 temperatura, porque el disipador sigue caliente. Se ajusta con un rango
 *desde / hasta* y un tiempo mínimo.
@@ -41,11 +45,23 @@ desgasta antes) y salud real frente a su capacidad original.
 **Privacidad.** Apagar la cámara la desconecta de verdad: `/dev/video*`
 desaparece del sistema.
 
+**Todos los sensores.** Frecuencia y temperatura de cada hilo, discos con su
+temperatura, memoria, red y qué está consumiendo ahora mismo.
+
+![Sensores](docs/img/sensores.png)
+
 **Herramientas.** Prueba de esfuerzo que dice si el procesador se frena por
 calor, prueba de ventiladores, informe del equipo al portapapeles, registro.
 
-**Widget de barra** para [Omarchy](https://omarchy.org/): temperatura de la
-pieza más caliente siempre a la vista, y el panel con todo el detalle.
+![Herramientas](docs/img/util.png)
+
+**Widget de barra** para [Omarchy](https://omarchy.org/): la temperatura de la
+pieza más caliente siempre a la vista, y al desplegarlo todo el detalle más los
+botones de perfil y de gráfica.
+
+Es **el mismo proyecto**, no dos: la ventana y el widget escriben la misma
+configuración y el demonio la aplica, así que cambies donde cambies, lo otro se
+entera.
 
 ## Cómo está hecho
 
@@ -69,8 +85,8 @@ bucle la mantendría en vela y tiraría abajo su ahorro de energía.
 Hace falta `python3`, `python-gobject` y `libadwaita`.
 
 ```bash
-git clone <este-repo> centro
-cd centro
+git clone https://github.com/jose22072000/linux-hardware-center.git
+cd linux-hardware-center
 sudo ./instalar.sh
 ```
 
@@ -103,3 +119,19 @@ los ventiladores.
 
 MIT. Incluye `gpu-mode`, de Dima Panov, también MIT — ver
 [TERCEROS.md](TERCEROS.md).
+
+## Ayuda y fallos
+
+Si algo no funciona en tu equipo, **abre un issue** con la salida de
+*Herramientas → Copiar informe del equipo*: ahí va el modelo de procesador, los
+sensores que detecta y qué controles tiene tu máquina. Con eso se puede añadir
+soporte para hardware que no tengo delante.
+
+Lo que más ayuda ahora mismo:
+
+- probarlo en portátiles de otras marcas (Lenovo, ASUS, HP…) y decir qué
+  detecta y qué no
+- probarlo en un sobremesa: debería enseñar sensores y perfiles, pero todavía
+  no gobierna ventiladores por `pwm`
+- traducciones: la interfaz está en español y todos los textos están en un
+  solo sitio en `bin/centro`

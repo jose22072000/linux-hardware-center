@@ -395,3 +395,72 @@ def top_procesos(n=5):
                 pass
     return r
 
+
+
+# ── Grafica integrada ───────────────────────────────────────────────────────
+_cache_igpu = []
+
+def gpu_integrada():
+    """Nodo DRM de la grafica integrada, buscado por fabricante."""
+    if _cache_igpu:
+        return _cache_igpu[0]
+    for d in sorted(glob.glob("/sys/class/drm/card*")):
+        v = _leer(os.path.join(d, "device/vendor"))
+        if v in ("0x8086", "0x1002"):          # Intel, AMD integrada
+            if os.path.exists(os.path.join(d, "gt_cur_freq_mhz")) or \
+               os.path.exists(os.path.join(d, "device/gpu_busy_percent")):
+                _cache_igpu.append(d)
+                return d
+    return None
+
+
+def igpu_estado(_prev={}):
+    """(uso %, MHz, MHz maximo) de la integrada.
+
+    El uso sale del hueco que deja RC6, el estado de reposo del motor
+    grafico: es actividad real medida, no una estimacion.
+
+    Dos cuidados que cuestan de descubrir:
+    - `gt_act_freq_mhz` es la frecuencia de este instante y vale 0 en cuanto
+      entra en reposo; `gt_cur_freq_mhz` es la pedida y no baja a cero. Se
+      enseña la real, y la pedida solo si la real es 0, para no mostrar
+      "18 % de uso a 0 MHz", que parece una averia y no lo es.
+    - Tras una suspension los contadores dejan de ser comparables: si el
+      salto no tiene sentido, mejor no decir nada que decir un disparate.
+    """
+    d = gpu_integrada()
+    if not d:
+        return (None, None, None)
+
+    act = _int(os.path.join(d, "gt_act_freq_mhz"), 0)
+    cur = _int(os.path.join(d, "gt_cur_freq_mhz"), 0)
+    mx = _int(os.path.join(d, "gt_max_freq_mhz"))
+    freq = act if act else cur
+
+    # AMD lo da hecho; Intel hay que calcularlo.
+    listo = _int(os.path.join(d, "device/gpu_busy_percent"))
+    if listo is not None:
+        return (listo, freq, mx)
+
+    rc6 = _int(os.path.join(d, "power/rc6_residency_ms"))
+    if rc6 is None:
+        return (None, freq, mx)
+    ahora = time.time() * 1000
+    p = _prev.get("v")
+    _prev["v"] = (rc6, ahora)
+    if not p:
+        return (None, freq, mx)
+    d_rc6, d_ms = rc6 - p[0], ahora - p[1]
+    if d_ms < 500 or d_rc6 < 0 or d_rc6 > d_ms + 200:
+        return (None, freq, mx)
+    return (max(0, min(100, round(100 - 100 * d_rc6 / d_ms))), freq, mx)
+
+
+def gpu_nombre():
+    """Nombre corto de la dedicada, para etiquetar sin confundirla con la
+    integrada."""
+    d = gpu_discreta()
+    if not d:
+        return None
+    v = _leer(os.path.join(d, "vendor"))
+    return {"0x10de": "NVIDIA", "0x1002": "AMD"}.get(v, "Dedicada")

@@ -42,8 +42,10 @@ class Aguja(Gtk.DrawingArea):
         self.aviso, self.critico = aviso, critico
         self.valor = None
         self.texto_alt = None
-        self.set_content_width(112)
-        self.set_content_height(118)
+        # Estrechos a proposito: cuantos menos pixeles pide cada uno, mas
+        # caben en una sola linea antes de que la fila tenga que partirse.
+        self.set_content_width(96)
+        self.set_content_height(112)
         self.set_draw_func(self._pintar)
 
     def poner(self, v, texto_alt=None):

@@ -65,7 +65,7 @@ bateria_limite=100
 super_bateria=off
 
 # Camara (on/off). Apagarla aqui la desconecta de verdad, no es un aviso.
-webcam=on
+webcam=off
 
 # ── Deteccion ───────────────────────────────────────────────────────────────
 # Nombres EXACTOS de proceso (los que da `pgrep -x`: el del ejecutable, no el

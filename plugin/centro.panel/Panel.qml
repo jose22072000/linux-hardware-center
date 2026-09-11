@@ -72,7 +72,7 @@ Panel {
 
   readonly property string healthText: {
     if (dieTemp <= 0) return "Leyendo"
-    if (dieTemp < 60) return "Fresco"
+    if (dieTemp < 60) return "Frio"
     if (dieTemp < 75) return "Templado"
     if (dieTemp < 85) return "Caliente"
     return "Muy caliente"
@@ -461,14 +461,17 @@ Panel {
             spacing: Style.space(8)
 
             Repeater {
+              // Juego y Trabajo no van aqui: los elige la maquina sola segun
+              // lo que este abierto. Estos son los que se fijan a mano.
               model: [
-                { m: "auto",   t: "Auto" },
-                { m: "reposo", t: "Reposo" },
-                { m: "fresco", t: "Fresco" }
+                { m: "auto",    t: "Auto" },
+                { m: "estable", t: "Estable" },
+                { m: "reposo",  t: "Reposo" },
+                { m: "fresco",  t: "Fresco" }
               ]
               Button {
                 required property var modelData
-                width: (parent.width - parent.spacing * 2) / 3
+                width: (parent.width - parent.spacing * 3) / 4
                 text: modelData.t
                 fontSize: Style.font.bodySmall
                 foreground: root.bar.foreground
