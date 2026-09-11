@@ -47,6 +47,60 @@ EC_IO = "/sys/kernel/debug/ec/ec0/io"
 REG = {"cpu_t": 0x6A, "cpu_v": 0x72, "gpu_t": 0x82, "gpu_v": 0x8A}
 
 
+class Vigia:
+    """Avisa en cuanto cambia el fichero de configuracion, sin sondear.
+
+    Antes se miraba el `mtime` cada 2 s, asi que pulsar un boton podia tardar
+    hasta 2 segundos en hacer efecto y se notaba como un tiron. Con inotify el
+    kernel nos despierta en cuanto el fichero cambia: la respuesta pasa a ser
+    inmediata y ademas se gasta menos, porque ya no hay que mirar nada entre
+    medias.
+
+    **Se vigila la CARPETA, no el fichero.** La ventana guarda escribiendo un
+    temporal y renombrandolo encima —que es la forma segura de guardar, porque
+    nunca deja el fichero a medias—, y eso destruye el inodo original: una
+    vigilancia sobre el fichero se quedaria sorda tras el primer guardado.
+    """
+
+    IN_CLOSE_WRITE = 0x00000008
+    IN_MOVED_TO    = 0x00000080
+    IN_CREATE      = 0x00000100
+
+    def __init__(self, ruta):
+        self.fd = None
+        self.nombre = os.path.basename(ruta)
+        try:
+            import ctypes
+            self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            fd = self.libc.inotify_init1(os.O_NONBLOCK)
+            if fd < 0:
+                return
+            wd = self.libc.inotify_add_watch(
+                fd, os.path.dirname(ruta).encode(),
+                self.IN_CLOSE_WRITE | self.IN_MOVED_TO | self.IN_CREATE)
+            if wd < 0:
+                os.close(fd)
+                return
+            self.fd = fd
+        except Exception:
+            self.fd = None
+
+    def esperar(self, segundos):
+        """Duerme hasta `segundos`, o hasta que el fichero cambie."""
+        if self.fd is None:
+            time.sleep(segundos)          # sin inotify, al menos sigue andando
+            return
+        import select
+        listos, _, _ = select.select([self.fd], [], [], segundos)
+        if listos:
+            try:
+                os.read(self.fd, 65536)   # vaciar la cola; no importa el detalle
+            except OSError:
+                pass
+            # Un respiro para que el renombrado termine antes de leer.
+            time.sleep(0.05)
+
+
 def ruta_config():
     u = hw.usuario_grafico()
     if not u:
@@ -298,6 +352,51 @@ def teclado_set(nivel):
         hw.escribir(os.path.join(d, "brightness"), nivel)
 
 
+def _en_horario(desde, hasta):
+    """¿Estamos dentro de la franja? Sirve para franjas que cruzan medianoche,
+    que es justo el caso de la noche (19:00 a 07:00)."""
+    try:
+        hd, md = (int(x) for x in desde.split(":"))
+        hh, mh = (int(x) for x in hasta.split(":"))
+    except (ValueError, AttributeError):
+        return False
+    ahora = time.localtime()
+    m = ahora.tm_hour * 60 + ahora.tm_min
+    ini, fin = hd * 60 + md, hh * 60 + mh
+    return (ini <= m or m < fin) if ini > fin else (ini <= m < fin)
+
+
+def teclado_auto(cfg, perfil):
+    """Enciende la luz del teclado de noche y la apaga de dia.
+
+    Este equipo no tiene sensor de luz —se comprobo: no hay nada en
+    `/sys/bus/iio/devices`— asi que se va por horario, que es lo unico
+    honesto que se puede hacer aqui.
+
+    No pisa al perfil `fresco`: ese apaga el teclado a proposito para quitar
+    calor de debajo de los dedos, y si el horario lo volviera a encender se
+    estarian peleando cada dos segundos.
+    """
+    if cfg.get("teclado_auto", "off") != "on" or perfil == "fresco":
+        return None
+    d = hw.led_teclado()
+    if not d:
+        return None
+    noche = _en_horario(cfg.get("teclado_desde", "18:00"),
+                        cfg.get("teclado_hasta", "07:00"))
+    try:
+        nivel = int(cfg.get("teclado_nivel", 2)) if noche else 0
+    except ValueError:
+        return None
+    mx = int(hw._leer(os.path.join(d, "max_brightness")) or 3)
+    nivel = max(0, min(mx, nivel))
+    if hw._leer(os.path.join(d, "brightness")) != str(nivel):
+        hw.escribir(os.path.join(d, "brightness"), nivel)
+        print(f"{time.strftime('%H:%M:%S')}  teclado -> {nivel}"
+              f" ({'noche' if noche else 'dia'})", flush=True)
+    return nivel
+
+
 def bateria_set(limite):
     b = hw.bateria()
     if not b or limite is None:
@@ -415,7 +514,9 @@ def aplicar_globales(cfg, prev):
         ec_set("fn_key", cfg.get("fn_key"), ("left", "right"))
     # El teclado retroiluminado solo se toca fuera de fresco: dentro de fresco
     # lo maneja el perfil, y pelearse consigo mismo lo dejaria parpadeando.
-    if cfg.get("teclado") != prev.get("teclado") and cfg.get("modo") != "fresco":
+    if (cfg.get("teclado") != prev.get("teclado")
+            and cfg.get("modo") != "fresco"
+            and cfg.get("teclado_auto", "off") != "on"):
         teclado_set(cfg.get("teclado"))
 
 
@@ -586,25 +687,18 @@ def main():
     actual, prev_cfg, prev_cfg_perfil, cfg = None, {}, {}, {}
     refuerzo = Refuerzo()
     enfriado = Enfriado()
+    vigia = Vigia(ruta)
+    if vigia.fd is None:
+        print("aviso: sin inotify, se vuelve a sondear cada tic", flush=True)
     proxima_revision = 0.0
-    marca = 0.0
 
     while True:
         ahora = time.monotonic()
 
-        # Si el fichero acaba de cambiar, no se espera al siguiente intervalo:
-        # el usuario acaba de tocar un interruptor y tiene que ver el efecto.
-        # Sin esto tardaba hasta 15 s y parecia que el control no funcionaba.
-        try:
-            m = os.path.getmtime(ruta)
-        except OSError:
-            m = marca
-        if m != marca:
-            marca = m
-            proxima_revision = 0.0
-
         # --- releer y decidir perfil ---
-        if ahora >= proxima_revision:
+        # Se relee tambien cuando nos despierta el vigia, aunque no toque por
+        # tiempo: ese despertar ES el usuario pulsando algo.
+        if ahora >= proxima_revision or leer_config(ruta) != cfg:
             cfg = leer_config(ruta)
             nuevo = decidir(cfg)
             if nuevo != actual:
@@ -632,6 +726,8 @@ def main():
             techo(cfg.get(f"{actual}_techo", 80))
             vigilar_fan_mode(cfg, actual)
         nivel = refuerzo.tic(cfg.get("refuerzo", "auto"))
+        if actual:
+            teclado_auto(cfg, actual)
 
         # Enfriado prolongado: puede pedir una curva distinta de la del perfil.
         media = (sum(refuerzo.hist) / len(refuerzo.hist)) if refuerzo.hist else None
@@ -649,7 +745,7 @@ def main():
                         f"refuerzo={nivel or 'no disponible'}\n")
         except OSError:
             pass
-        time.sleep(TIC)
+        vigia.esperar(TIC)
 
 
 if __name__ == "__main__":

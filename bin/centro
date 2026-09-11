@@ -745,12 +745,35 @@ class Ventana(Adw.ApplicationWindow):
 
             if hw.led_teclado():
                 mx = int(hw._leer(os.path.join(hw.led_teclado(), "max_brightness")) or 3)
-                sp = Adw.SpinRow.new_with_range(0, mx, 1)
-                sp.set_title("Luz del teclado")
-                sp.set_subtitle("son luces bajo las teclas: apagarlas quita calor "
-                                "justo donde apoyas los dedos")
-                sp.set_value(int(cfg.get("teclado", 0) or 0))
-                sp.connect("notify::value", self._set_num, "teclado")
+
+                self.sw_tecl = Adw.SwitchRow(
+                    title="Luz del teclado automática",
+                    subtitle="se enciende de noche y se apaga de día")
+                self.sw_tecl.set_active(cfg.get("teclado_auto", "off") == "on")
+                self.sw_tecl.connect("notify::active", self._set_sw, "teclado_auto")
+                g.add(self.sw_tecl)
+
+                # Horas con selector, no escribiendo. Este equipo no tiene
+                # sensor de luz —se comprobó— así que el horario es lo único
+                # honesto que se puede ofrecer.
+                for clave, titulo, defecto in (("teclado_desde", "Se enciende a las", "18:00"),
+                                               ("teclado_hasta", "Se apaga a las", "07:00")):
+                    sp = Adw.SpinRow.new_with_range(0, 23, 1)
+                    sp.set_title(titulo)
+                    sp.set_subtitle("hora")
+                    try:
+                        sp.set_value(int(cfg.get(clave, defecto).split(":")[0]))
+                    except (ValueError, AttributeError):
+                        sp.set_value(int(defecto.split(":")[0]))
+                    sp.connect("notify::value", self._set_hora, clave)
+                    g.add(sp)
+
+                sp = Adw.SpinRow.new_with_range(1, mx, 1)
+                sp.set_title("Brillo del teclado de noche")
+                sp.set_subtitle("son luces bajo las teclas: cuanto más alto, "
+                                "más calor justo donde apoyas los dedos")
+                sp.set_value(int(cfg.get("teclado_nivel", 2) or 2))
+                sp.connect("notify::value", self._set_num, "teclado_nivel")
                 g.add(sp)
 
             if hw.ec_get("fn_key") is not None:
@@ -823,6 +846,10 @@ class Ventana(Adw.ApplicationWindow):
     def _set_num(self, s, _, clave):
         if not self.cargando:
             escribir_conf({clave: str(int(s.get_value()))})
+
+    def _set_hora(self, s, _, clave):
+        if not self.cargando:
+            escribir_conf({clave: f"{int(s.get_value()):02d}:00"})
 
     def _set_sw(self, sw, _, clave):
         if not self.cargando:

@@ -96,3 +96,10 @@ accion=
 refresco_desde=75
 refresco_hasta=60
 refresco_minimo=90
+
+# Luz del teclado automatica. Este equipo no tiene sensor de luz, asi que va
+# por horario. El perfil "fresco" la apaga y manda sobre esto.
+teclado_auto=on
+teclado_desde=18:00
+teclado_hasta=07:00
+teclado_nivel=2

@@ -43,7 +43,11 @@ temperatura, porque el disipador sigue caliente. Se ajusta con un rango
 desgasta antes) y salud real frente a su capacidad original.
 
 **Privacidad.** Apagar la cámara la desconecta de verdad: `/dev/video*`
-desaparece del sistema.
+desaparece del sistema, y el piloto de la tecla se apaga con ella.
+
+**Luz del teclado automática.** Se enciende al caer la tarde y se apaga por la
+mañana. Va por horario porque la mayoría de los portátiles no traen sensor de
+luz; si el tuyo no tiene teclado retroiluminado, el control no aparece.
 
 **Todos los sensores.** Frecuencia y temperatura de cada hilo, discos con su
 temperatura, memoria, red y qué está consumiendo ahora mismo.
