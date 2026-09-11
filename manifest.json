@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "centro.panel",
+  "name": "Centro",
+  "version": "1.0.0",
+  "author": "jose22072000",
+  "description": "Temperaturas, ventiladores, perfiles que cambian solos, batería y gráfica híbrida. Detecta el hardware: lo que tu equipo no tenga, no aparece.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Centro",
+    "description": "Estado del equipo de un vistazo y acciones rápidas de perfil y gráfica.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLabel": true
+    },
+    "aliases": [
+      "centro",
+      "temperatura",
+      "ventilador",
+      "fan",
+      "cpu",
+      "gpu",
+      "thermal",
+      "msi",
+      "bateria",
+      "hardware"
+    ],
+    "schema": []
+  },
+  "license": "MIT",
+  "activation": "on-demand",
+  "homepage": "https://github.com/jose22072000/linux-hardware-center"
+}

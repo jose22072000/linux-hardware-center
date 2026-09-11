@@ -60,6 +60,11 @@ Panel {
 
   // ── Perfil termico ──
   readonly property string perfil: root.str("perfil", "?")
+  // Sin el demonio no hay perfiles ni control: el widget solo puede MIRAR.
+  // Quien instale esto con `omarchy plugin add` tiene el widget pero no el
+  // servicio, y los botones no harian nada. Mejor decirlo que dejar botones
+  // muertos.
+  readonly property bool hayServicio: root.perfil !== "?" && root.perfil !== ""
   readonly property bool perfilForzado: root.str("perfil_modo", "auto") !== "auto"
 
   // Se delega en el script del plugin nenadjokic, que sabe restaurar el valor
@@ -385,8 +390,26 @@ Panel {
           }
 
           InfoPair {
+            visible: root.hayServicio
             label: "Ahora"
             value: root.perfil + (root.perfilForzado ? " · fijado a mano" : " · automatico")
+          }
+
+          Column {
+            visible: !root.hayServicio
+            width: parent.width
+            spacing: Style.spacing.labelGap
+            InfoValue {
+              text: "El servicio no esta instalado."
+              width: parent.width
+              wrapMode: Text.WordWrap
+            }
+            InfoLabel {
+              text: "Sin el solo se puede mirar: los perfiles y la curva del "
+                    + "ventilador necesitan permisos. Pulsa Centro para ver como."
+              width: parent.width
+              wrapMode: Text.WordWrap
+            }
           }
 
           Row {

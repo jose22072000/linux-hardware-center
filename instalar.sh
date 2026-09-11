@@ -75,11 +75,22 @@ instalar() {
   fi
 
   # El widget de barra es solo para Omarchy; en otro escritorio se salta.
+  #
+  # Dos caminos posibles y los dos tienen que funcionar:
+  #   `omarchy plugin add <url>`  ya dejo el repo EN la carpeta de plugins, y
+  #                               entonces no hay nada que copiar
+  #   `git clone` a mano          hay que copiar el widget a su sitio
   if [[ -d "$PLUGINS" ]]; then
-    info "widget de barra (Omarchy)"
-    cp -r "$AQUI/plugin/centro.panel" "$PLUGINS/"
-    chown -R "$USUARIO": "$PLUGINS/centro.panel"
-    echo "     añadelo a la barra con:  omarchy bar add centro.panel"
+    DESTINO="$PLUGINS/centro.panel"
+    if [[ "$AQUI" -ef "$DESTINO" ]]; then
+      info "widget de barra: ya esta en su sitio"
+    else
+      info "widget de barra (Omarchy)"
+      install -d -o "$USUARIO" -m 755 "$DESTINO"
+      install -o "$USUARIO" -m 644 "$AQUI/manifest.json" "$AQUI/Panel.qml" "$DESTINO/"
+      install -o "$USUARIO" -m 755 "$AQUI/centro-stats" "$DESTINO/"
+    fi
+    echo "     para verlo en la barra:  omarchy plugin enable centro.panel"
   fi
 
   # Los discos SATA no publican temperatura sin este modulo, y no se carga solo.

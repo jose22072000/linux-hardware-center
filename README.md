@@ -86,17 +86,34 @@ bucle la mantendría en vela y tiraría abajo su ahorro de energía.
 
 Hace falta `python3`, `python-gobject` y `libadwaita`.
 
+### En Omarchy
+
+```bash
+omarchy plugin add https://github.com/jose22072000/linux-hardware-center.git --enable
+```
+
+Eso pone el widget en la barra. Para que además funcionen los perfiles y la
+curva del ventilador hace falta el servicio, que necesita permisos:
+
+```bash
+sudo ~/.config/omarchy/plugins/centro.panel/instalar.sh
+```
+
+Son dos pasos a propósito: el widget solo lee, pero cambiar la curva del
+ventilador o el tope del procesador se escribe en el controlador del equipo y
+eso pide root. Si te quedas en el primer paso, el widget te lo dice en vez de
+enseñarte botones que no harían nada.
+
+### En cualquier otro escritorio
+
 ```bash
 git clone https://github.com/jose22072000/linux-hardware-center.git
 cd linux-hardware-center
 sudo ./instalar.sh
 ```
 
-En Omarchy, para el icono de la barra:
-
-```bash
-omarchy bar add centro.panel
-```
+Tendrás la ventana y el servicio; el widget de barra es solo para Omarchy y se
+salta solo.
 
 Para quitarlo todo: `sudo ./instalar.sh desinstalar`. Tu configuración se
 queda por si vuelves.
